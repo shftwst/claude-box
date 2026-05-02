@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+# claude-box — run Claude Code in Docker with --dangerously-skip-permissions
+#
+# Mounts the project dir at its exact host path so skill symlinks resolve.
+# Persists Claude Code state (settings, conversations) in ~/.claude-box/state/
+# across runs — delete that dir to reset.
+# Syncs ~/.claude skills, plugins, hooks, and .mcp.json read-only into the
+# container so your local setup is always reflected.
+#
+# Usage:
+#   claude-box                  # interactive session in current directory
+#   claude-box /path/to/dir     # interactive session in another directory
+#   claude-box . -c             # continue most recent session here
+#   claude-box . --resume       # pick a session to resume (interactive picker)
+#   claude-box . -r <id>        # resume a specific session by ID
+#   claude-box . -p "..."       # non-interactive prompt (pipe-friendly)
+#
+# Installation:
+#   git clone https://github.com/shftwst/claude-box ~/claude-box
+#   ln -sf ~/claude-box/claude-box /usr/local/bin/claude-box
+#   # or add ~/claude-box to PATH
+
+set -euo pipefail
+
+CLAUDE_BOX_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "${1:-$PWD}" && pwd)"
+CLAUDE_HOME="${HOME}/.claude"
+IMAGE="claude-box"
+DOCKERFILE="${CLAUDE_BOX_DIR}/Dockerfile"
+BUILT_MARKER="${HOME}/.claude-box/.built"
+
+CONTAINER_NAME="claude-box-$(basename "$PROJECT_DIR")-$$"
+
+# Build the image if it doesn't exist or the Dockerfile has changed
+if ! docker image inspect "$IMAGE" &>/dev/null || [[ "$DOCKERFILE" -nt "$BUILT_MARKER" ]]; then
+  echo "Building claude-box image..." >&2
+  docker build -f "$DOCKERFILE" -t "$IMAGE" "$CLAUDE_BOX_DIR"
+  mkdir -p "$(dirname "$BUILT_MARKER")"
+  touch "$BUILT_MARKER"
+fi
+
+# Persistent state dir — preserves settings, conversation history, etc. across
+# runs so Claude Code doesn't re-run setup on every launch. Delete to reset.
+STATE_DIR="${HOME}/.claude-box/state"
+mkdir -p "$STATE_DIR"
+chmod 777 "$STATE_DIR"
+
+cleanup() {
+  rm -f "$tmp_claude_md" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+# Env vars to forward into the container.
+# Add project-specific vars by setting CLAUDE_BOX_EXTRA_VARS before invoking:
+#   CLAUDE_BOX_EXTRA_VARS=(TURSO_AUTH_TOKEN MY_API_KEY) claude-box
+FORWARD_VARS=(
+  ANTHROPIC_API_KEY
+  GITHUB_TOKEN
+  GITHUB_PERSONAL_ACCESS_TOKEN
+  LINEAR_API_KEY
+  "${CLAUDE_BOX_EXTRA_VARS[@]+"${CLAUDE_BOX_EXTRA_VARS[@]}"}"
+)
+
+env_args=()
+for var in "${FORWARD_VARS[@]}"; do
+  [[ -n "${!var:-}" ]] && env_args+=(-e "${var}=${!var}")
+done
+
+# Concatenate CLAUDE.md files: global base → parent dirs → project (project wins)
+tmp_claude_md="$(mktemp)"
+
+if [[ -f "${CLAUDE_HOME}/CLAUDE.md" ]]; then
+  cat "${CLAUDE_HOME}/CLAUDE.md" >> "$tmp_claude_md"
+fi
+
+declare -a claude_files=()
+current="$PROJECT_DIR"
+while [[ "$current" != "/" ]]; do
+  [[ -f "$current/CLAUDE.md" ]] && claude_files+=("$current/CLAUDE.md")
+  current="$(dirname "$current")"
+done
+
+for (( i=${#claude_files[@]}-1; i>=0; i-- )); do
+  f="${claude_files[$i]}"
+  printf '\n<!-- %s -->\n' "$f" >> "$tmp_claude_md"
+  cat "$f" >> "$tmp_claude_md"
+done
+
+# Specific ~/.claude entries to bind-mount read-only on top of the state volume.
+# Pre-create the mount-point directories/files as host-user-owned so Docker
+# doesn't create them as root (which would leave root-owned paths in STATE_DIR
+# that the cleanup trap can't delete).
+declare -a override_mounts=()
+for entry in plugins skills hooks .mcp.json; do
+  if [[ -e "${CLAUDE_HOME}/${entry}" ]]; then
+    if [[ -d "${CLAUDE_HOME}/${entry}" ]]; then
+      mkdir -p "${STATE_DIR}/${entry}"
+    else
+      touch "${STATE_DIR}/${entry}"
+    fi
+    override_mounts+=(-v "${CLAUDE_HOME}/${entry}:${CLAUDE_HOME}/${entry}:ro")
+  fi
+done
+
+# Symlinked skills point to absolute paths outside ~/.claude (e.g. other repos).
+# Collect the unique parent dirs of all symlink targets and mount them read-only
+# so those paths resolve inside the container.
+while IFS= read -r dir; do
+  [[ -d "$dir" ]] && override_mounts+=(-v "${dir}:${dir}:ro")
+done < <(
+  find "${CLAUDE_HOME}/skills" -maxdepth 1 -type l 2>/dev/null \
+    | while IFS= read -r link; do
+        target=$(readlink "$link" 2>/dev/null) && dirname "$target"
+      done \
+    | sort -u
+)
+touch "${STATE_DIR}/CLAUDE.md"
+override_mounts+=(-v "${tmp_claude_md}:${CLAUDE_HOME}/CLAUDE.md:ro")
+
+# Extract credentials from macOS Keychain and write to the state dir.
+# On Linux there is no Keychain; Claude Code falls back to ~/.claude/.credentials.json.
+if KEYCHAIN_CRED=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null); then
+  echo "$KEYCHAIN_CRED" > "${STATE_DIR}/.credentials.json"
+fi
+
+# Sync host config files into the state dir.
+# Only syncs when the host file is newer (first run, or after host update).
+# Claude Code then reads/writes the state-dir copies, keeping container state
+# independent of the host after the initial seed.
+
+_sync_js="${TMPDIR:-/tmp}/claude-box-sync.$$.js"
+cat > "$_sync_js" <<'JSEOF'
+const fs = require('fs');
+const [,, mode, src, dst] = process.argv;
+const s = JSON.parse(fs.readFileSync(src, 'utf8'));
+if (mode === 'settings') {
+  delete s.sandbox;
+  delete s.hooks;
+  // Rewrite macOS bun path to container path so plugins like claude-hud work.
+  if (s.statusLine && s.statusLine.command) {
+    s.statusLine.command = s.statusLine.command.replace(/\/opt\/homebrew\/bin\/bun/g, '/usr/local/bin/bun');
+  }
+}
+fs.writeFileSync(dst, JSON.stringify(s, null, 2));
+JSEOF
+
+HOST_SETTINGS="${CLAUDE_HOME}/settings.json"
+STATE_SETTINGS="${STATE_DIR}/settings.json"
+if [[ -f "$HOST_SETTINGS" ]] && { [[ ! -f "$STATE_SETTINGS" ]] || [[ "$HOST_SETTINGS" -nt "$STATE_SETTINGS" ]]; }; then
+  node "$_sync_js" settings "$HOST_SETTINGS" "$STATE_SETTINGS"
+fi
+
+HOST_CLAUDE_JSON="${HOME}/.claude.json"
+STATE_CLAUDE_JSON="${STATE_DIR}/.claude.json"
+if [[ -f "$HOST_CLAUDE_JSON" ]] && { [[ ! -f "$STATE_CLAUDE_JSON" ]] || [[ "$HOST_CLAUDE_JSON" -nt "$STATE_CLAUDE_JSON" ]]; }; then
+  node "$_sync_js" passthrough "$HOST_CLAUDE_JSON" "$STATE_CLAUDE_JSON"
+fi
+
+rm -f "$_sync_js"
+
+# Mount .claude.json (main state) into the container at the home dir level
+override_mounts+=(-v "${STATE_CLAUDE_JSON}:${HOME}/.claude.json")
+
+# Use -it only when stdin is a real TTY (interactive) — drop -t in piped/autonomous runs.
+TTY_FLAGS=(-i)
+[[ -t 0 ]] && TTY_FLAGS+=(-t)
+
+# Mount order matters: state volume first, then specific overrides shadow it
+# for the paths that need to reflect the host (settings, skills, CLAUDE.md).
+# Entrypoint runs as root, creates a hostuser for HOST_UID, then drops to it.
+docker run --rm "${TTY_FLAGS[@]}" \
+  --name "$CONTAINER_NAME" \
+  -e "HOST_UID=$(id -u)" \
+  -e "HOST_GID=$(id -g)" \
+  -e "HOME=${HOME}" \
+  -e "SKIP_NPM_PACKAGES_INSTALL=1" \
+  -e "GIT_CONFIG_COUNT=1" \
+  -e "GIT_CONFIG_KEY_0=safe.directory" \
+  -e "GIT_CONFIG_VALUE_0=*" \
+  -v "${PROJECT_DIR}:${PROJECT_DIR}" \
+  -v "${STATE_DIR}:${CLAUDE_HOME}" \
+  ${override_mounts[@]+"${override_mounts[@]}"} \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  ${env_args[@]+"${env_args[@]}"} \
+  -w "${PROJECT_DIR}" \
+  "$IMAGE" \
+  --dangerously-skip-permissions "${@:2}"
