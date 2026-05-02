@@ -90,7 +90,13 @@ done
 # Pre-create the mount-point directories/files as host-user-owned so Docker
 # doesn't create them as root (which would leave root-owned paths in STATE_DIR
 # that the cleanup trap can't delete).
+# Mount gh CLI credentials so `gh` works inside the container without re-authing.
 declare -a override_mounts=()
+GH_CONFIG_DIR="${HOME}/.config/gh"
+if [[ -d "$GH_CONFIG_DIR" ]]; then
+  override_mounts+=(-v "${GH_CONFIG_DIR}:${GH_CONFIG_DIR}:ro")
+fi
+
 for entry in plugins skills hooks .mcp.json; do
   if [[ -e "${CLAUDE_HOME}/${entry}" ]]; then
     if [[ -d "${CLAUDE_HOME}/${entry}" ]]; then
