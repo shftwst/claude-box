@@ -2,7 +2,7 @@ FROM node:22-bookworm-slim
 
 # System deps + GitHub CLI + Docker CLI (for GitHub MCP server)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git curl ca-certificates gnupg unzip jq \
+    git curl ca-certificates gnupg unzip jq openssh-client \
     && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
        | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
     && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
