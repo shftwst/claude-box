@@ -22,7 +22,14 @@
 
 set -euo pipefail
 
-CLAUDE_BOX_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve symlinks so installs via `ln -sf ~/claude-box/claude-box /usr/local/bin/`
+# (or homebrew's /opt/homebrew/bin) still find the Dockerfile in the repo dir.
+_self="${BASH_SOURCE[0]}"
+while [[ -L "$_self" ]]; do
+  _link=$(readlink "$_self")
+  [[ "$_link" = /* ]] && _self="$_link" || _self="$(dirname "$_self")/$_link"
+done
+CLAUDE_BOX_DIR="$(cd "$(dirname "$_self")" && pwd)"
 PROJECT_DIR="$(cd "${1:-$PWD}" && pwd)"
 CLAUDE_HOME="${HOME}/.claude"
 IMAGE="claude-box"
