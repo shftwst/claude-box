@@ -62,6 +62,18 @@ Or set it in your shell profile:
 export CLAUDE_BOX_EXTRA_VARS=(TURSO_AUTH_TOKEN NETLIFY_AUTH_TOKEN)
 ```
 
+### Per-project values via `.env.claude-box`
+
+Drop a `.env.claude-box` file in a project root to supply project-specific values for any of the forwarded vars. It's sourced just before the env lookup, so values here override whatever's in your shell — useful when each project is backed by a different API key (e.g. different `LINEAR_API_KEY` per workspace).
+
+```bash
+# .env.claude-box (in your project root, gitignored)
+LINEAR_API_KEY=lin_proj_specific_xxx
+TURSO_AUTH_TOKEN=ey...
+```
+
+Plain `KEY=value` lines work — no `export` needed. Add `.env.claude-box` to `.gitignore` (or rely on your global `.env.*` ignore) since it holds secrets.
+
 ## State
 
 State lives in `~/.claude-box/state/` — this is the `~/.claude` directory as seen by Claude Code inside the container. Conversation history, project memories, and settings persist here across runs.
