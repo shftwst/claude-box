@@ -97,6 +97,10 @@ if [[ -z "${GH_TOKEN:-}" ]] && GH_TOKEN=$(gh auth token 2>/dev/null); then
 fi
 
 declare -a override_mounts=()
+
+# Mount SSH keys so git over SSH works inside the container.
+[[ -d "${HOME}/.ssh" ]] && override_mounts+=(-v "${HOME}/.ssh:${HOME}/.ssh:ro")
+
 for entry in plugins skills hooks .mcp.json; do
   if [[ -e "${CLAUDE_HOME}/${entry}" ]]; then
     if [[ -d "${CLAUDE_HOME}/${entry}" ]]; then
@@ -180,9 +184,13 @@ docker run --rm "${TTY_FLAGS[@]}" \
   -e "HOST_GID=$(id -g)" \
   -e "HOME=${HOME}" \
   -e "SKIP_NPM_PACKAGES_INSTALL=1" \
-  -e "GIT_CONFIG_COUNT=1" \
+  -e "GIT_CONFIG_COUNT=3" \
   -e "GIT_CONFIG_KEY_0=safe.directory" \
   -e "GIT_CONFIG_VALUE_0=*" \
+  -e "GIT_CONFIG_KEY_1=url.https://github.com/.insteadOf" \
+  -e "GIT_CONFIG_VALUE_1=git@github.com:" \
+  -e "GIT_CONFIG_KEY_2=credential.helper" \
+  -e "GIT_CONFIG_VALUE_2=!gh auth git-credential" \
   -v "${PROJECT_DIR}:${PROJECT_DIR}" \
   -v "${STATE_DIR}:${CLAUDE_HOME}" \
   ${override_mounts[@]+"${override_mounts[@]}"} \
