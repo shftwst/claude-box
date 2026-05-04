@@ -61,6 +61,20 @@ FORWARD_VARS=(
   "${CLAUDE_BOX_EXTRA_VARS[@]+"${CLAUDE_BOX_EXTRA_VARS[@]}"}"
 )
 
+# Per-project overrides: source ${PROJECT_DIR}/.env.claude-box if present so
+# each project can supply its own values (e.g. a project-specific LINEAR_API_KEY)
+# without having to re-export them in the calling shell. Values here win over
+# whatever's in the host shell because the assignments execute right before the
+# FORWARD_VARS lookup. set -a auto-exports each assignment so plain KEY=value
+# lines work without needing `export`.
+PROJECT_ENV_FILE="${PROJECT_DIR}/.env.claude-box"
+if [[ -f "$PROJECT_ENV_FILE" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$PROJECT_ENV_FILE"
+  set +a
+fi
+
 env_args=()
 for var in "${FORWARD_VARS[@]}"; do
   [[ -n "${!var:-}" ]] && env_args+=(-e "${var}=${!var}")
