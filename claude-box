@@ -123,6 +123,13 @@ declare -a override_mounts=()
 # Mount SSH keys so git over SSH works inside the container.
 [[ -d "${HOME}/.ssh" ]] && override_mounts+=(-v "${HOME}/.ssh:${HOME}/.ssh:ro")
 
+# Per-project extra mounts. Set CLAUDE_BOX_EXTRA_MOUNTS in .env.claude-box (or
+# the calling shell) to an array of host:container[:opts] specs, e.g.:
+#   CLAUDE_BOX_EXTRA_MOUNTS=("$HOME/.aws:$HOME/.aws:ro" "/data:/data")
+for spec in "${CLAUDE_BOX_EXTRA_MOUNTS[@]+"${CLAUDE_BOX_EXTRA_MOUNTS[@]}"}"; do
+  override_mounts+=(-v "$spec")
+done
+
 for entry in plugins skills hooks .mcp.json; do
   if [[ -e "${CLAUDE_HOME}/${entry}" ]]; then
     if [[ -d "${CLAUDE_HOME}/${entry}" ]]; then
@@ -205,6 +212,7 @@ docker run --rm "${TTY_FLAGS[@]}" \
   -e "HOST_UID=$(id -u)" \
   -e "HOST_GID=$(id -g)" \
   -e "HOME=${HOME}" \
+  -e "COLORTERM=truecolor" \
   -e "SKIP_NPM_PACKAGES_INSTALL=1" \
   -e "GIT_CONFIG_COUNT=3" \
   -e "GIT_CONFIG_KEY_0=safe.directory" \
