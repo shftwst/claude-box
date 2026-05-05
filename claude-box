@@ -6,6 +6,11 @@
 # across runs — delete that dir to reset.
 # Syncs ~/.claude skills, plugins, hooks, and .mcp.json read-only into the
 # container so your local setup is always reflected.
+# Sessions for the current project are written to ~/.claude/projects/<slug>/
+# on the host so they're resumable from host Claude as well as future
+# claude-box runs in the same project. Session-keyed satellite state (todos,
+# shell env, pastes, plans, file-history) is also shared so resume preserves
+# more than just the transcript.
 #
 # Usage:
 #   claude-box                  # interactive session in current directory
@@ -122,6 +127,29 @@ declare -a override_mounts=()
 
 # Mount SSH keys so git over SSH works inside the container.
 [[ -d "${HOME}/.ssh" ]] && override_mounts+=(-v "${HOME}/.ssh:${HOME}/.ssh:ro")
+
+# Per-project session sharing: bind-mount just this project's session dir from
+# the host so sessions started in claude-box are resumable from host Claude
+# (and vice versa). Scoped to the current project so other projects' history
+# stays isolated in the state volume. Claude encodes project paths by replacing
+# `/` with `-`; we mirror that to find the matching subdir.
+PROJECT_SLUG="${PROJECT_DIR//\//-}"
+HOST_PROJECT_SESSIONS="${CLAUDE_HOME}/projects/${PROJECT_SLUG}"
+mkdir -p "$HOST_PROJECT_SESSIONS"
+override_mounts+=(-v "${HOST_PROJECT_SESSIONS}:${HOST_PROJECT_SESSIONS}")
+
+# Session-keyed satellite state. Each of these dirs holds one entry per session
+# UUID (todos, shell env snapshots, pastes, plan-mode drafts, file-edit
+# history). Sharing them with the host means a session started in claude-box
+# resumes in host Claude — and vice versa — with full fidelity, not just the
+# conversation transcript. Trade-off: because entries are keyed by session UUID
+# (not project), the container can see satellite state for sessions from other
+# projects. No corruption risk; UUIDs don't collide. mkdir -p so a fresh host
+# without these dirs doesn't end up with root-owned mount points.
+for entry in tasks session-env shell-snapshots paste-cache plans file-history; do
+  mkdir -p "${CLAUDE_HOME}/${entry}"
+  override_mounts+=(-v "${CLAUDE_HOME}/${entry}:${CLAUDE_HOME}/${entry}")
+done
 
 # Per-project extra mounts. Set CLAUDE_BOX_EXTRA_MOUNTS in .env.claude-box (or
 # the calling shell) to an array of host:container[:opts] specs, e.g.:
