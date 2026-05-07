@@ -228,6 +228,16 @@ rm -f "$_sync_js"
 # Mount .claude.json (main state) into the container at the home dir level
 override_mounts+=(-v "${STATE_CLAUDE_JSON}:${HOME}/.claude.json")
 
+# Set the terminal tab/window title to the project name so it's obvious which
+# box this tab belongs to (otherwise it just shows "bash" or "docker"). OSC 0
+# sets both icon name and window title — supported by iTerm2, Terminal.app,
+# gnome-terminal, kitty, alacritty, tmux, etc. Gated on stderr being a tty so
+# piped/non-interactive runs don't leak escape codes. The parent shell's
+# prompt hook normally restores its own title after we exit.
+if [[ -t 2 ]]; then
+  printf '\e]0;claude-box: %s\a' "$(basename "$PROJECT_DIR")" >&2
+fi
+
 # Use -it only when stdin is a real TTY (interactive) — drop -t in piped/autonomous runs.
 TTY_FLAGS=(-i)
 [[ -t 0 ]] && TTY_FLAGS+=(-t)
