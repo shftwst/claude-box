@@ -74,6 +74,23 @@ TURSO_AUTH_TOKEN=ey...
 
 Plain `KEY=value` lines work — no `export` needed. Add `.env.claude-box` to `.gitignore` (or rely on your global `.env.*` ignore) since it holds secrets.
 
+## Extra mounts
+
+By default the container sees: the project dir, `~/.ssh` (read-only), `~/.claude` skills/plugins/hooks/`.mcp.json` (read-only), and the Docker socket. To expose additional host paths inside the container, set `CLAUDE_BOX_EXTRA_MOUNTS` to an array of `host:container[:opts]` specs:
+
+```bash
+CLAUDE_BOX_EXTRA_MOUNTS=("$HOME/.aws:$HOME/.aws:ro" "/data:/data") claude-box
+```
+
+Or per-project in `.env.claude-box`:
+
+```bash
+# .env.claude-box
+CLAUDE_BOX_EXTRA_MOUNTS=("$HOME/.config/gcloud:$HOME/.config/gcloud:ro")
+```
+
+Each entry is passed straight to `docker run -v`, so the standard `:ro` / `:rw` / propagation suffixes all work. Use this when a project needs cloud credentials, a shared dataset, or any other host directory that isn't part of the default mount set.
+
 ## State
 
 State lives in `~/.claude-box/state/` — this is the `~/.claude` directory as seen by Claude Code inside the container. Conversation history, project memories, and settings persist here across runs.
