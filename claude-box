@@ -27,6 +27,9 @@
 
 set -euo pipefail
 
+# Progress logs to stderr, gated on a tty so piped/non-interactive runs stay clean.
+log() { [[ -t 2 ]] && printf '[claude-box] %s\n' "$*" >&2; }
+
 # Resolve symlinks so installs via `ln -sf ~/claude-box/claude-box /usr/local/bin/`
 # (or homebrew's /opt/homebrew/bin) still find the Dockerfile in the repo dir.
 _self="${BASH_SOURCE[0]}"
@@ -45,7 +48,7 @@ CONTAINER_NAME="claude-box-$(basename "$PROJECT_DIR")-$$"
 
 # Build the image if it doesn't exist or the Dockerfile has changed
 if ! docker image inspect "$IMAGE" &>/dev/null || [[ "$DOCKERFILE" -nt "$BUILT_MARKER" ]]; then
-  echo "Building claude-box image..." >&2
+  log "building image..."
   docker build -f "$DOCKERFILE" -t "$IMAGE" "$CLAUDE_BOX_DIR"
   mkdir -p "$(dirname "$BUILT_MARKER")"
   touch "$BUILT_MARKER"
@@ -119,8 +122,9 @@ done
 # that the cleanup trap can't delete).
 # Extract gh CLI token from the host (keychain-backed on macOS) and forward it
 # as GH_TOKEN so `gh` works inside the container without re-authing.
-if [[ -z "${GH_TOKEN:-}" ]] && GH_TOKEN=$(gh auth token 2>/dev/null); then
-  env_args+=(-e "GH_TOKEN=${GH_TOKEN}")
+if [[ -z "${GH_TOKEN:-}" ]]; then
+  log "fetching gh auth token..."
+  GH_TOKEN=$(gh auth token 2>/dev/null) && env_args+=(-e "GH_TOKEN=${GH_TOKEN}") || true
 fi
 
 declare -a override_mounts=()
@@ -172,6 +176,7 @@ done
 # Symlinked skills point to absolute paths outside ~/.claude (e.g. other repos).
 # Collect the unique parent dirs of all symlink targets and mount them read-only
 # so those paths resolve inside the container.
+log "resolving skill symlinks..."
 while IFS= read -r dir; do
   [[ -d "$dir" ]] && override_mounts+=(-v "${dir}:${dir}:ro")
 done < <(
@@ -186,6 +191,7 @@ override_mounts+=(-v "${tmp_claude_md}:${CLAUDE_HOME}/CLAUDE.md:ro")
 
 # Extract credentials from macOS Keychain and write to the state dir.
 # On Linux there is no Keychain; Claude Code falls back to ~/.claude/.credentials.json.
+log "reading Claude credentials from keychain..."
 if KEYCHAIN_CRED=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null); then
   echo "$KEYCHAIN_CRED" > "${STATE_DIR}/.credentials.json"
 fi
@@ -245,6 +251,7 @@ TTY_FLAGS=(-i)
 # Mount order matters: state volume first, then specific overrides shadow it
 # for the paths that need to reflect the host (settings, skills, CLAUDE.md).
 # Entrypoint runs as root, creates a hostuser for HOST_UID, then drops to it.
+log "starting container..."
 docker run --rm "${TTY_FLAGS[@]}" \
   --name "$CONTAINER_NAME" \
   -e "HOST_UID=$(id -u)" \
