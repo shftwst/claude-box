@@ -43,6 +43,18 @@ RUN curl -fsSL "https://github.com/tianon/gosu/releases/download/1.17/gosu-$(dpk
     && chmod +x /usr/local/bin/gosu \
     && gosu nobody true
 
+# ugrep + shadow grep with it. Claude Code on the host transparently redirects
+# `grep` to ugrep (via a shell function) so patterns can use ugrep extensions
+# like `\t` in -E regex. Subprocesses spawned by Claude Code (e.g. statusLine
+# commands from plugins like claude-hud) don't inherit that shell function, so
+# in the container we install ugrep system-wide and put a `grep` symlink on
+# /usr/local/bin (which precedes /usr/bin on PATH) — anything resolving `grep`
+# via PATH gets ugrep, while scripts that hardcode /usr/bin/grep still hit the
+# stock GNU grep.
+RUN apt-get update && apt-get install -y --no-install-recommends ugrep \
+    && ln -sf /usr/bin/ugrep /usr/local/bin/grep \
+    && rm -rf /var/lib/apt/lists/*
+
 # Claude Code
 RUN npm install -g @anthropic-ai/claude-code
 
