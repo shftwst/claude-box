@@ -87,8 +87,13 @@ mkdir -p "${HOME}/.claude-box"
 # Uses --ff-only so a dirty install dir errors out instead of silently merging.
 if [[ $UPGRADE -eq 1 ]]; then
   log "upgrading claude-box at ${CLAUDE_BOX_DIR}..."
-  git -C "$CLAUDE_BOX_DIR" pull --ff-only
-  exit $?
+  if git -C "$CLAUDE_BOX_DIR" pull --ff-only; then
+    rm -f "$UPDATE_AVAILABLE_FILE"
+    touch "$UPDATE_CHECK_FILE"
+    exit 0
+  else
+    exit $?
+  fi
 fi
 
 # Show cached update hint (zero-latency: just a file-existence check).
