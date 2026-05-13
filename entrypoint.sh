@@ -28,6 +28,14 @@ if [ "$(id -u)" = "0" ] && [ "${HOST_UID}" != "0" ]; then
   mkdir -p "${HOST_HOME}"
   chown "${HOST_UID}:${HOST_GID}" "${HOST_HOME}"
 
+  # Docker Desktop forwards the host ssh-agent at /run/host-services/ssh-auth.sock
+  # but the socket inside the container is root-owned. Chown it to the host user
+  # so signing/git-over-ssh works without escalation. Silently ignore if absent
+  # (Linux Docker / no agent forwarded / --no-ssh).
+  if [ -S /run/host-services/ssh-auth.sock ]; then
+    chown "${HOST_UID}:${HOST_GID}" /run/host-services/ssh-auth.sock || true
+  fi
+
   # gosu does a direct exec as the user — no shell wrapper, proper TTY + signal
   # inheritance for Claude Code's interactive UI.
   exec gosu "${USERNAME}" claude "$@"

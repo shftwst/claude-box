@@ -20,6 +20,10 @@
 #   claude-box . -r <id>        # resume a specific session by ID
 #   claude-box . -p "..."       # non-interactive prompt (pipe-friendly)
 #
+# claude-box-specific flags (consumed before claude sees them; position-free):
+#   --no-ssh                    # skip ~/.ssh mount and SSH_AUTH_SOCK forwarding
+#                                 (signing/git-over-ssh disabled inside container)
+#
 # Installation:
 #   git clone https://github.com/shftwst/claude-box ~/claude-box
 #   ln -sf ~/claude-box/claude-box /usr/local/bin/claude-box
@@ -29,6 +33,18 @@ set -euo pipefail
 
 # Progress logs to stderr, gated on a tty so piped/non-interactive runs stay clean.
 log() { [[ -t 2 ]] && printf '[claude-box] %s\n' "$*" >&2; }
+
+# Pull claude-box's own flags out of "$@" before anything else looks at args,
+# so the project-dir positional and the claude-flag passthrough stay clean.
+NO_SSH=0
+declare -a _passthrough=()
+for arg in "$@"; do
+  case "$arg" in
+    --no-ssh) NO_SSH=1 ;;
+    *) _passthrough+=("$arg") ;;
+  esac
+done
+set -- "${_passthrough[@]+"${_passthrough[@]}"}"
 
 # Resolve symlinks so installs via `ln -sf ~/claude-box/claude-box /usr/local/bin/`
 # (or homebrew's /opt/homebrew/bin) still find the Dockerfile in the repo dir.
@@ -129,8 +145,40 @@ fi
 
 declare -a override_mounts=()
 
-# Mount SSH keys so git over SSH works inside the container.
-[[ -d "${HOME}/.ssh" ]] && override_mounts+=(-v "${HOME}/.ssh:${HOME}/.ssh:ro")
+# Mount SSH keys + forward ssh-agent so git-over-SSH and signing work inside
+# the container. Agent forwarding means the host's already-unlocked key is used
+# directly — no passphrase prompt per commit. Skipped if --no-ssh was passed.
+#
+# macOS quirk: Docker Desktop can't bind-mount sockets under
+# /private/tmp/com.apple.launchd.* (the native ssh-agent socket path). It
+# exposes a magic forwarded socket at /run/host-services/ssh-auth.sock that
+# proxies to the host agent; we swap to that path when the launchd pattern is
+# detected. 1Password's socket (~/.1password/agent.sock) is a regular file and
+# mounts directly without needing the magic path.
+if [[ $NO_SSH -eq 0 ]]; then
+  [[ -d "${HOME}/.ssh" ]] && override_mounts+=(-v "${HOME}/.ssh:${HOME}/.ssh:ro")
+  if [[ -n "${SSH_AUTH_SOCK:-}" ]]; then
+    if [[ "$SSH_AUTH_SOCK" == /private/tmp/com.apple.launchd.* ]]; then
+      override_mounts+=(-v "/run/host-services/ssh-auth.sock:/run/host-services/ssh-auth.sock")
+      env_args+=(-e "SSH_AUTH_SOCK=/run/host-services/ssh-auth.sock")
+    elif [[ -S "$SSH_AUTH_SOCK" ]]; then
+      override_mounts+=(-v "${SSH_AUTH_SOCK}:${SSH_AUTH_SOCK}")
+      env_args+=(-e "SSH_AUTH_SOCK=${SSH_AUTH_SOCK}")
+    fi
+  fi
+else
+  log "ssh disabled (--no-ssh): no key mount, no agent forwarding"
+fi
+
+# Mount host ~/.gitconfig read-only so user name/email, aliases, signing config,
+# etc. carry into the container. Read-only so a runaway tool can't clobber it.
+[[ -f "${HOME}/.gitconfig" ]] && override_mounts+=(-v "${HOME}/.gitconfig:${HOME}/.gitconfig:ro")
+
+# Share XDG cache (pip wheels, npm/yarn tarballs, playwright browsers, etc.) so
+# first-run downloads survive container exit and are shared across boxes.
+# mkdir -p so Docker doesn't create a root-owned dir on a host without ~/.cache.
+mkdir -p "${HOME}/.cache"
+override_mounts+=(-v "${HOME}/.cache:${HOME}/.cache")
 
 # Per-project session sharing: bind-mount just this project's session dir from
 # the host so sessions started in claude-box are resumable from host Claude
