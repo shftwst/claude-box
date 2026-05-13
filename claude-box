@@ -23,6 +23,8 @@
 # claude-box-specific flags (consumed before claude sees them; position-free):
 #   --no-ssh                    # skip ~/.ssh mount and SSH_AUTH_SOCK forwarding
 #                                 (signing/git-over-ssh disabled inside container)
+#   --upgrade                   # git pull the claude-box install dir and exit
+#                                 (next run rebuilds the image if needed)
 #
 # Installation:
 #   git clone https://github.com/shftwst/claude-box ~/claude-box
@@ -37,10 +39,12 @@ log() { [[ -t 2 ]] && printf '[claude-box] %s\n' "$*" >&2; }
 # Pull claude-box's own flags out of "$@" before anything else looks at args,
 # so the project-dir positional and the claude-flag passthrough stay clean.
 NO_SSH=0
+UPGRADE=0
 declare -a _passthrough=()
 for arg in "$@"; do
   case "$arg" in
     --no-ssh) NO_SSH=1 ;;
+    --upgrade) UPGRADE=1 ;;
     *) _passthrough+=("$arg") ;;
   esac
 done
@@ -54,6 +58,16 @@ while [[ -L "$_self" ]]; do
   [[ "$_link" = /* ]] && _self="$_link" || _self="$(dirname "$_self")/$_link"
 done
 CLAUDE_BOX_DIR="$(cd "$(dirname "$_self")" && pwd)"
+
+# --upgrade: pull latest claude-box and exit. Next regular run picks up any
+# Dockerfile/entrypoint changes via the mtime-vs-BUILT_MARKER check below.
+# Uses --ff-only so a dirty install dir errors out instead of silently merging.
+if [[ $UPGRADE -eq 1 ]]; then
+  log "upgrading claude-box at ${CLAUDE_BOX_DIR}..."
+  git -C "$CLAUDE_BOX_DIR" pull --ff-only
+  exit $?
+fi
+
 PROJECT_DIR="$(cd "${1:-$PWD}" && pwd)"
 CLAUDE_HOME="${HOME}/.claude"
 IMAGE="claude-box"
