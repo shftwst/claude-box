@@ -17,6 +17,15 @@ Both live under `~/.claude-box/` (sibling to the existing `state/` dir and `.bui
 
 Using file existence + mtime (rather than parsing content) keeps the read path branch-free and avoids cross-platform `stat` flag issues.
 
+Two new variables alongside the existing `BUILT_MARKER` declaration:
+
+```bash
+UPDATE_CHECK_FILE="${HOME}/.claude-box/.last-update-check"
+UPDATE_AVAILABLE_FILE="${HOME}/.claude-box/.update-available"
+```
+
+The parent dir `${HOME}/.claude-box/` is only `mkdir -p`'d inside the image-build branch (claude-box:92), so the new code must ensure it exists before touching the cache files — a `mkdir -p "${HOME}/.claude-box"` once near the variable declarations covers both the read and the background-write paths.
+
 ## Launch flow
 
 Added near the top of `claude-box`, **after** `CLAUDE_BOX_DIR` is resolved and **after** the `--upgrade` short-circuit (so `--upgrade` itself doesn't trigger a check before pulling).
