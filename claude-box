@@ -91,6 +91,17 @@ if [[ $UPGRADE -eq 1 ]]; then
   exit $?
 fi
 
+# Show cached update hint (zero-latency: just a file-existence check).
+[[ -e "$UPDATE_AVAILABLE_FILE" ]] && \
+  log "update available — run 'claude-box --upgrade' to pull latest"
+
+# If our cached check is missing or >24h old, kick off a fresh check in the
+# background. `find -mtime -1` is portable across BSD (macOS) and GNU find.
+if [[ ! -f "$UPDATE_CHECK_FILE" ]] || \
+   [[ -z "$(find "$UPDATE_CHECK_FILE" -mtime -1 2>/dev/null)" ]]; then
+  check_for_update_in_background
+fi
+
 PROJECT_DIR="$(cd "${1:-$PWD}" && pwd)"
 CLAUDE_HOME="${HOME}/.claude"
 IMAGE="claude-box"
