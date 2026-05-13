@@ -36,6 +36,25 @@ set -euo pipefail
 # Progress logs to stderr, gated on a tty so piped/non-interactive runs stay clean.
 log() { [[ -t 2 ]] && printf '[claude-box] %s\n' "$*" >&2; }
 
+# Background-check the install dir against its upstream. Detached so the parent
+# never waits and silent on every failure mode (not a repo, no upstream,
+# offline, fetch fails) — those skips don't touch $UPDATE_CHECK_FILE so we
+# retry next launch instead of going dark for 24h on a transient blip.
+check_for_update_in_background() {
+  (
+    cd "$CLAUDE_BOX_DIR" || exit 0
+    git rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1 || exit 0
+    git fetch --quiet 2>/dev/null || exit 0
+    if [[ $(git rev-list --count HEAD..@{u} 2>/dev/null || echo 0) -gt 0 ]]; then
+      touch "$UPDATE_AVAILABLE_FILE"
+    else
+      rm -f "$UPDATE_AVAILABLE_FILE"
+    fi
+    touch "$UPDATE_CHECK_FILE"
+  ) >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+}
+
 # Pull claude-box's own flags out of "$@" before anything else looks at args,
 # so the project-dir positional and the claude-flag passthrough stay clean.
 NO_SSH=0
