@@ -58,12 +58,21 @@ PROJECT_DIR="$(cd "${1:-$PWD}" && pwd)"
 CLAUDE_HOME="${HOME}/.claude"
 IMAGE="claude-box"
 DOCKERFILE="${CLAUDE_BOX_DIR}/Dockerfile"
+ENTRYPOINT_SH="${CLAUDE_BOX_DIR}/entrypoint.sh"
 BUILT_MARKER="${HOME}/.claude-box/.built"
 
 CONTAINER_NAME="claude-box-$(basename "$PROJECT_DIR")-$$"
 
-# Build the image if it doesn't exist or the Dockerfile has changed
-if ! docker image inspect "$IMAGE" &>/dev/null || [[ "$DOCKERFILE" -nt "$BUILT_MARKER" ]]; then
+# Build the image if it doesn't exist or any build input has changed. Includes
+# entrypoint.sh because it's COPYed into the image, so changes there need a
+# rebuild even when the Dockerfile itself is unchanged.
+needs_build=0
+if ! docker image inspect "$IMAGE" &>/dev/null; then
+  needs_build=1
+elif [[ "$DOCKERFILE" -nt "$BUILT_MARKER" || "$ENTRYPOINT_SH" -nt "$BUILT_MARKER" ]]; then
+  needs_build=1
+fi
+if [[ $needs_build -eq 1 ]]; then
   log "building image..."
   docker build -f "$DOCKERFILE" -t "$IMAGE" "$CLAUDE_BOX_DIR"
   mkdir -p "$(dirname "$BUILT_MARKER")"
