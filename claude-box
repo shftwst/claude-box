@@ -59,6 +59,10 @@ while [[ -L "$_self" ]]; do
 done
 CLAUDE_BOX_DIR="$(cd "$(dirname "$_self")" && pwd)"
 
+UPDATE_CHECK_FILE="${HOME}/.claude-box/.last-update-check"
+UPDATE_AVAILABLE_FILE="${HOME}/.claude-box/.update-available"
+mkdir -p "${HOME}/.claude-box"
+
 # --upgrade: pull latest claude-box and exit. Next regular run picks up any
 # Dockerfile/entrypoint changes via the mtime-vs-BUILT_MARKER check below.
 # Uses --ff-only so a dirty install dir errors out instead of silently merging.
