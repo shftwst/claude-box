@@ -56,7 +56,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends ugrep \
     && rm -rf /var/lib/apt/lists/*
 
 # Claude Code
-RUN npm install -g @anthropic-ai/claude-code
+RUN npm install -g @anthropic-ai/claude-code \
+    && npm cache clean --force
 
 COPY entrypoint.sh /usr/local/bin/claude-box-entrypoint.sh
 RUN chmod +x /usr/local/bin/claude-box-entrypoint.sh
