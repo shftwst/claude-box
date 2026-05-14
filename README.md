@@ -1,12 +1,12 @@
 # claude-box
 
-Run Claude Code in a Docker sandbox with `--dangerously-skip-permissions` — no macOS approval prompts, no risk to your host system.
-
-Designed as a drop-in replacement for running Claude Code locally: full interactive TTY, persistent state across sessions, all your skills and plugins available inside the container.
+A Docker sandbox for Claude Code that feels native. Your global skills, plugins, MCP servers, git config, and persistent Claude sessions all carry over — with per-project overrides via a simple `.env.claude-box` file.
 
 ## Why
 
-Claude Code's permission system is great for cautious use but creates friction for autonomous/faff-skill runs. Running inside Docker gives you the bypass without compromising your host — the container can't escape the bind-mounted directories.
+Plenty of options already run Claude Code in a sandbox — Docker's built-in sandbox mode, generic containers, dev containers. The harder problem is making that sandbox feel like running Claude natively: every `~/.claude/` skill resolved (including symlinks pointing into other repos), MCP servers reachable, `.gitconfig` and SSH agent forwarded, macOS Keychain credentials still valid, sessions resumable across container and host.
+
+claude-box bridges that gap. It wires up the bind-mounts, credential extraction, and env forwarding so you get the `--dangerously-skip-permissions` bypass without giving up the native ergonomics. And `.env.claude-box` lets each project layer its own forwarded env vars and extra mounts on top — no global config edits, no remembering which API key belongs to which workspace.
 
 ## How it works
 
@@ -14,6 +14,7 @@ Claude Code's permission system is great for cautious use but creates friction f
 - `~/.claude-box/state/` persists Claude Code state (settings, conversation history) across runs — delete to reset
 - `~/.claude` skills, plugins, hooks, and `.mcp.json` are bind-mounted read-only so your local setup is always reflected
 - Symlinked skills (pointing outside `~/.claude/`) have their parent dirs auto-mounted
+- Sessions for the current project are written back to `~/.claude/projects/<slug>/` on the host, so a conversation started in claude-box is resumable from host Claude — and vice versa. Session-keyed satellite state (todos, plan-mode drafts, file-edit history) is shared too
 - macOS Keychain credentials are extracted at launch and written to the state dir
 - `settings.json` is synced on first run (stripping sandbox/hooks, rewriting macOS-specific paths)
 
@@ -45,6 +46,13 @@ claude-box . -p "..."       # non-interactive prompt (pipe-friendly)
 ```
 
 All arguments after the first (directory) are passed directly to `claude`.
+
+### claude-box flags
+
+These are consumed by the wrapper before `claude` sees them (position-free, so they can appear anywhere on the command line):
+
+- `--upgrade` — `git pull` the install dir and exit. See [Updating](#updating).
+- `--no-ssh` — skip mounting `~/.ssh` and forwarding the SSH agent. Disables git-over-SSH and commit signing inside the container; useful for sessions that don't touch git remotes.
 
 ## Extra env vars
 
@@ -104,7 +112,15 @@ rm -rf ~/.claude-box/state/
 ## Updating
 
 ```bash
-cd ~/claude-box && git pull
+claude-box --upgrade
 ```
 
-The image rebuilds automatically on the next run when the Dockerfile changes.
+This runs `git pull --ff-only` on the install dir and exits. The image rebuilds automatically on the next regular run when the Dockerfile or entrypoint changed.
+
+On startup, claude-box does a backgrounded `git fetch` against the install dir at most once every 24 hours. When the check finds you're behind upstream, the next launch prints a single hint line:
+
+```
+[claude-box] update available — run 'claude-box --upgrade' to pull latest
+```
+
+The check runs detached and adds no perceptible latency to launch; the hint disappears the next time `--upgrade` succeeds.
