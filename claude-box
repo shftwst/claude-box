@@ -161,11 +161,22 @@ fi
 # Add project-specific vars by setting CLAUDE_BOX_EXTRA_VARS, either in your
 # shell before invoking or inside the project's .env.claude-box:
 #   CLAUDE_BOX_EXTRA_VARS=(TURSO_AUTH_TOKEN MY_API_KEY) claude-box
+# Forward TERM + COLORFGBG only if the host shell has them set — don't synthesize
+# defaults. Claude Code's theme auto-detect works correctly when the container
+# inherits exactly what iTerm2 (or whatever terminal) provides, and synthesizing
+# values has surprising side effects.
+# Specifically, do NOT set COLORTERM=truecolor in the docker run env — even
+# though the terminal supports it, forcing it in the container causes Claude
+# Code's palette derivation to pick a broken combo (white-on-white prompt and
+# response text). Let the terminal advertise its own capabilities through
+# whatever vars iTerm2 already exports.
 FORWARD_VARS=(
   ANTHROPIC_API_KEY
   GITHUB_TOKEN
   GITHUB_PERSONAL_ACCESS_TOKEN
   LINEAR_API_KEY
+  TERM
+  COLORFGBG
   "${CLAUDE_BOX_EXTRA_VARS[@]+"${CLAUDE_BOX_EXTRA_VARS[@]}"}"
 )
 
@@ -354,9 +365,16 @@ if [[ -t 2 ]]; then
   printf '\e]0;claude-box: %s\a' "$(basename "$PROJECT_DIR")" >&2
 fi
 
-# Use -it only when stdin is a real TTY (interactive) — drop -t in piped/autonomous runs.
+# Allocate a PTY (-t) whenever any of stdin/stdout/stderr is a real TTY. Claude
+# Code's Ink-rendered TUI needs the container's stdout to be a PTY for color +
+# layout detection; without it the welcome banner and status line render as
+# white-on-white with raw ANSI artifacts. Drop -t only in fully piped/autonomous
+# runs (no TTY anywhere) so docker doesn't inject CRLF translation that mangles
+# stdout pipes.
 TTY_FLAGS=(-i)
-[[ -t 0 ]] && TTY_FLAGS+=(-t)
+if [[ -t 0 || -t 1 || -t 2 ]]; then
+  TTY_FLAGS+=(-t)
+fi
 
 # Mount order matters: state volume first, then specific overrides shadow it
 # for the paths that need to reflect the host (settings, skills, CLAUDE.md).
@@ -367,7 +385,6 @@ docker run --rm "${TTY_FLAGS[@]}" \
   -e "HOST_UID=$(id -u)" \
   -e "HOST_GID=$(id -g)" \
   -e "HOME=${HOME}" \
-  -e "COLORTERM=truecolor" \
   -e "SKIP_NPM_PACKAGES_INSTALL=1" \
   -e "GIT_CONFIG_COUNT=3" \
   -e "GIT_CONFIG_KEY_0=safe.directory" \
