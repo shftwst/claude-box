@@ -307,7 +307,14 @@ override_mounts+=(-v "${HOME}/.cache:${HOME}/.cache")
 PROJECT_SLUG="${PROJECT_DIR//\//-}"
 HOST_PROJECT_SESSIONS="${CLAUDE_HOME}/projects/${PROJECT_SLUG}"
 mkdir -p "$HOST_PROJECT_SESSIONS"
-override_mounts+=(-v "${HOST_PROJECT_SESSIONS}:${HOST_PROJECT_SESSIONS}")
+mkdir -p "${STATE_DIR}/projects/${PROJECT_SLUG}"
+# On Colima, skip the override mount — the freshly-created host dir isn't
+# visible to the VM, so Docker creates an empty ephemeral directory instead.
+# Sessions fall through to the state dir's projects folder, and we sync them
+# back to the host after docker exits.
+if [[ "${DOCKER_HOST:-}" != */.colima/* ]]; then
+  override_mounts+=(-v "${HOST_PROJECT_SESSIONS}:${HOST_PROJECT_SESSIONS}")
+fi
 
 # Session-keyed satellite state. Each of these dirs holds one entry per session
 # UUID (todos, shell env snapshots, pastes, plan-mode drafts, file-edit
@@ -476,11 +483,29 @@ docker run --rm "${TTY_FLAGS[@]}" \
   "$IMAGE" \
   --dangerously-skip-permissions "${@:2}" || true
 
-# Show resume hint.
-set +eo pipefail
-_session=$(find "${HOST_PROJECT_SESSIONS}" "${STATE_DIR}/projects/${PROJECT_SLUG}" \
-           -name "*.jsonl" -maxdepth 1 2>/dev/null | xargs ls -t 2>/dev/null | head -1)
-if [[ -n "$_session" ]]; then
-  _id=$(basename "$_session" .jsonl)
-  printf '\nTo resume this conversation:\n  claude-box %s -r %s\n' "${1:-.}" "$_id" >&2
+set +euo pipefail
+# Flush sessions from the VM back to the host. On Colima, files written by the
+# container may not be visible on the host due to virtiofs caching. Copy them
+# out through Docker's I/O path, then into the host project sessions dir.
+_state_proj="${STATE_DIR}/projects/${PROJECT_SLUG}"
+if [[ "${DOCKER_HOST:-}" == */.colima/* ]]; then
+  # Extract session files from the VM via a helper container — the host can't
+  # see them directly due to virtiofs caching.
+  _cid=$(docker create --entrypoint sleep -v "${STATE_DIR}:/_state:ro" "${IMAGE}" 1 2>/dev/null)
+  if [[ -n "$_cid" ]]; then
+    docker cp "${_cid}:/_state/projects/${PROJECT_SLUG}/." "${_state_proj}/" 2>/dev/null || true
+    docker rm -f "$_cid" >/dev/null 2>&1 || true
+  fi
+fi
+# Copy sessions to the host's Claude project dir for cross-tool resumability.
+cp -f "${_state_proj}/"*.jsonl "$HOST_PROJECT_SESSIONS/" 2>/dev/null
+cp -rf "${_state_proj}/"*/ "$HOST_PROJECT_SESSIONS/" 2>/dev/null
+
+_latest=""
+for f in "${HOST_PROJECT_SESSIONS}/"*.jsonl; do
+  [[ -f "$f" ]] && { [[ -z "$_latest" || "$f" -nt "$_latest" ]] && _latest="$f"; }
+done
+if [[ -n "$_latest" ]]; then
+  _id=$(basename "$_latest" .jsonl)
+  printf '[claude-box] to resume: claude-box %s -r %s\n' "${1:-.}" "$_id" >&2
 fi
