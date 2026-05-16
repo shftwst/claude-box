@@ -4,7 +4,7 @@
 # Mounts the project dir at its exact host path so skill symlinks resolve.
 # Persists Claude Code state (settings, conversations) in ~/.claude-box/state/
 # across runs — delete that dir to reset.
-# Syncs ~/.claude skills, plugins, hooks, and .mcp.json read-only into the
+# Syncs ~/.claude skills, plugins, hooks, and .mcp.json into the
 # container so your local setup is always reflected.
 # Sessions for the current project are written to ~/.claude/projects/<slug>/
 # on the host so they're resumable from host Claude as well as future
@@ -211,7 +211,7 @@ for (( i=${#claude_files[@]}-1; i>=0; i-- )); do
   cat "$f" >> "${STATE_DIR}/CLAUDE.md"
 done
 
-# Specific ~/.claude entries to bind-mount read-only on top of the state volume.
+# Specific ~/.claude entries to bind-mount on top of the state volume.
 # Pre-create the mount-point directories/files as host-user-owned so Docker
 # doesn't create them as root (which would leave root-owned paths in STATE_DIR
 # that the cleanup trap can't delete).
@@ -290,8 +290,15 @@ else
 fi
 
 # Mount host ~/.gitconfig read-only so user name/email, aliases, signing config,
-# etc. carry into the container. Read-only so a runaway tool can't clobber it.
-[[ -f "${HOME}/.gitconfig" ]] && override_mounts+=(-v "${HOME}/.gitconfig:${HOME}/.gitconfig:ro")
+# etc. carry into the container. On Colima, copy into state dir instead (virtiofs
+# can't see single host files reliably for bind mounts).
+if [[ -f "${HOME}/.gitconfig" ]]; then
+  if [[ "${DOCKER_HOST:-}" == */.colima/* ]]; then
+    cp -f "${HOME}/.gitconfig" "${STATE_DIR}/.gitconfig" 2>/dev/null || true
+  else
+    override_mounts+=(-v "${HOME}/.gitconfig:${HOME}/.gitconfig:ro")
+  fi
+fi
 
 # Share XDG cache (pip wheels, npm/yarn tarballs, playwright browsers, etc.) so
 # first-run downloads survive container exit and are shared across boxes.
@@ -326,7 +333,11 @@ fi
 # without these dirs doesn't end up with root-owned mount points.
 for entry in tasks session-env shell-snapshots paste-cache plans file-history; do
   mkdir -p "${CLAUDE_HOME}/${entry}"
-  override_mounts+=(-v "${CLAUDE_HOME}/${entry}:${CLAUDE_HOME}/${entry}")
+  # On Colima, skip these override mounts — virtiofs can't see the host dirs.
+  # The state dir already has these paths and they'll be synced back after exit.
+  if [[ "${DOCKER_HOST:-}" != */.colima/* ]]; then
+    override_mounts+=(-v "${CLAUDE_HOME}/${entry}:${CLAUDE_HOME}/${entry}")
+  fi
 done
 
 # Per-project extra mounts. Set CLAUDE_BOX_EXTRA_MOUNTS in .env.claude-box (or
@@ -336,30 +347,38 @@ for spec in "${CLAUDE_BOX_EXTRA_MOUNTS[@]+"${CLAUDE_BOX_EXTRA_MOUNTS[@]}"}"; do
   override_mounts+=(-v "$spec")
 done
 
-for entry in plugins skills hooks .mcp.json; do
-  if [[ -e "${CLAUDE_HOME}/${entry}" ]]; then
-    if [[ -d "${CLAUDE_HOME}/${entry}" ]]; then
-      mkdir -p "${STATE_DIR}/${entry}"
-    else
-      touch "${STATE_DIR}/${entry}"
+# On non-Colima runtimes, overlay-mount host ~/.claude entries on top
+# of the state dir so the container always reflects the host's current setup.
+# On Colima, these mounts silently fail (virtiofs can't see the host dirs), so
+# we skip them here and sync into the state dir later via host-side cp + flush.
+if [[ "${DOCKER_HOST:-}" != */.colima/* ]]; then
+  for entry in plugins skills hooks .mcp.json; do
+    if [[ -e "${CLAUDE_HOME}/${entry}" ]]; then
+      if [[ -d "${CLAUDE_HOME}/${entry}" ]]; then
+        mkdir -p "${STATE_DIR}/${entry}"
+      else
+        touch "${STATE_DIR}/${entry}"
+      fi
+      override_mounts+=(-v "${CLAUDE_HOME}/${entry}:${CLAUDE_HOME}/${entry}:rw")
     fi
-    override_mounts+=(-v "${CLAUDE_HOME}/${entry}:${CLAUDE_HOME}/${entry}:ro")
-  fi
-done
+  done
 
-# Symlinked skills point to absolute paths outside ~/.claude (e.g. other repos).
-# Collect the unique parent dirs of all symlink targets and mount them read-only
-# so those paths resolve inside the container.
-log "resolving skill symlinks..."
-while IFS= read -r dir; do
-  [[ -d "$dir" ]] && override_mounts+=(-v "${dir}:${dir}:ro")
-done < <(
-  find "${CLAUDE_HOME}/skills" -maxdepth 1 -type l 2>/dev/null \
-    | while IFS= read -r link; do
-        target=$(readlink "$link" 2>/dev/null) && dirname "$target"
-      done \
-    | sort -u
-)
+  # Symlinked skills point to absolute paths outside ~/.claude (e.g. other repos).
+  # Collect the unique parent dirs of all symlink targets and mount them rw
+  # so those paths resolve inside the container and skills can be developed.
+  log "resolving skill symlinks..."
+  while IFS= read -r dir; do
+    [[ -d "$dir" ]] && override_mounts+=(-v "${dir}:${dir}:rw")
+  done < <(
+    find "${CLAUDE_HOME}/skills" -maxdepth 1 -type l 2>/dev/null \
+      | while IFS= read -r link; do
+          target=$(readlink "$link" 2>/dev/null) && dirname "$target"
+        done \
+      | sort -u
+  )
+else
+  log "resolving skill symlinks..."
+fi
 # Sync Claude OAuth credentials into the state dir. On macOS the canonical
 # source is the Keychain ("Claude Code-credentials"); ~/.claude/.credentials.json
 # on macOS often holds only MCP OAuth state (no claudeAiOauth block), so
@@ -433,12 +452,24 @@ done
 # warming the VM's filesystem cache. Other runtimes skip this — they share the
 # full host filesystem without caching issues.
 if [[ "${DOCKER_HOST:-}" == */.colima/* ]]; then
+  # Sync host ~/.claude entries (plugins, skills, hooks, .mcp.json) into the
+  # state dir. Overlay mounts from the host fail on Colima (virtiofs can't see
+  # host-written dirs), so everything must be in the state dir volume.
+  log "syncing host config for colima..."
+  for _sync_entry in plugins skills hooks; do
+    if [[ -d "${CLAUDE_HOME}/${_sync_entry}" ]]; then
+      mkdir -p "${STATE_DIR}/${_sync_entry}"
+      rsync -aL --delete "${CLAUDE_HOME}/${_sync_entry}/" "${STATE_DIR}/${_sync_entry}/" 2>/dev/null || \
+        cp -rfL "${CLAUDE_HOME}/${_sync_entry}/." "${STATE_DIR}/${_sync_entry}/" 2>/dev/null || true
+    fi
+  done
+  [[ -f "${CLAUDE_HOME}/.mcp.json" ]] && cp -f "${CLAUDE_HOME}/.mcp.json" "${STATE_DIR}/.mcp.json" 2>/dev/null || true
+
+  # Flush the entire state dir through Docker I/O so the VM sees everything —
+  # both the files we just synced and the volatile files (credentials, settings).
   log "flushing state for colima..."
-  # Flush state dir files
-  tar -cf - -C "${STATE_DIR}" CLAUDE.md .credentials.json .claude.json settings.json 2>/dev/null \
-    | docker run --rm -i --entrypoint tar -v "${STATE_DIR}:/_state" "${IMAGE}" -xf - -C /_state 2>/dev/null || true
-  # Warm the project sessions dir so the override mount works
-  docker run --rm --entrypoint ls -v "${HOST_PROJECT_SESSIONS}:/_sessions" "${IMAGE}" /_sessions >/dev/null 2>&1 || true
+  tar --no-xattrs -cf - -C "${STATE_DIR}" . 2>/dev/null \
+    | docker run --rm -i --entrypoint tar -v "${STATE_DIR}:/_state" "${IMAGE}" --no-same-owner -xf - -C /_state 2>/dev/null || true
 fi
 
 # Mount .claude.json (main state) into the container at the home dir level
@@ -501,11 +532,17 @@ if [[ "${DOCKER_HOST:-}" == */.colima/* ]]; then
   # see them directly due to virtiofs caching.
   # Extract container-written files from the VM via a helper container — the
   # host can't see them directly due to virtiofs caching.
-  _cid=$(docker create --entrypoint sleep -v "${STATE_DIR}:/_state:ro" "${IMAGE}" 1 2>/dev/null)
+  # Extract container-written state from the VM via a helper container — the
+  # host can't see them directly due to virtiofs caching.
+  log "syncing state back from colima..."
+  _cid=$(docker create --entrypoint sleep -v "${STATE_DIR}:/_state:rw" "${IMAGE}" 1 2>/dev/null)
   if [[ -n "$_cid" ]]; then
+    # Sessions, .claude.json, and satellite state (tasks, todos, etc.)
     docker cp "${_cid}:/_state/projects/${PROJECT_SLUG}/." "${_state_proj}/" 2>/dev/null || true
-    # Sync back .claude.json so trust acceptance and other state persists.
     docker cp "${_cid}:/_state/.claude.json" "${STATE_DIR}/.claude.json" 2>/dev/null || true
+    for _sat in tasks session-env shell-snapshots paste-cache plans file-history; do
+      docker cp "${_cid}:/_state/${_sat}/." "${STATE_DIR}/${_sat}/" 2>/dev/null || true
+    done
     docker rm -f "$_cid" >/dev/null 2>&1 || true
   fi
 fi

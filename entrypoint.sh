@@ -27,6 +27,11 @@ done
 mkdir -p "${HOME}/.claude/themes"
 cp -f /usr/local/share/claude-box-theme.json "${HOME}/.claude/themes/claude-box.json" 2>/dev/null || true
 
+# If .gitconfig was synced into the state dir (Colima), copy it to $HOME.
+# Also clean up stale directory if Docker created one at $HOME/.gitconfig.
+[ -d "${HOME}/.gitconfig" ] && rm -rf "${HOME}/.gitconfig"
+[ -f "${HOME}/.claude/.gitconfig" ] && cp -f "${HOME}/.claude/.gitconfig" "${HOME}/.gitconfig" 2>/dev/null || true
+
 echo "[entrypoint] starting..." >&2
 if [ "$(id -u)" = "0" ] && [ "${HOST_UID}" != "0" ]; then
   echo "[entrypoint] creating user UID=${HOST_UID} GID=${HOST_GID}..." >&2
