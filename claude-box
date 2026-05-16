@@ -383,6 +383,11 @@ cat > "$_sync_js" <<'JSEOF'
 const fs = require('fs');
 const [,, mode, src, dst] = process.argv;
 const s = JSON.parse(fs.readFileSync(src, 'utf8'));
+if (mode === 'passthrough') {
+  // Pre-accept the bypass permissions dialog so --dangerously-skip-permissions
+  // doesn't prompt every run.
+  s.bypassPermissionsModeAccepted = true;
+}
 if (mode === 'settings') {
   delete s.sandbox;
   delete s.hooks;
@@ -491,9 +496,13 @@ _state_proj="${STATE_DIR}/projects/${PROJECT_SLUG}"
 if [[ "${DOCKER_HOST:-}" == */.colima/* ]]; then
   # Extract session files from the VM via a helper container — the host can't
   # see them directly due to virtiofs caching.
+  # Extract container-written files from the VM via a helper container — the
+  # host can't see them directly due to virtiofs caching.
   _cid=$(docker create --entrypoint sleep -v "${STATE_DIR}:/_state:ro" "${IMAGE}" 1 2>/dev/null)
   if [[ -n "$_cid" ]]; then
     docker cp "${_cid}:/_state/projects/${PROJECT_SLUG}/." "${_state_proj}/" 2>/dev/null || true
+    # Sync back .claude.json so trust acceptance and other state persists.
+    docker cp "${_cid}:/_state/.claude.json" "${STATE_DIR}/.claude.json" 2>/dev/null || true
     docker rm -f "$_cid" >/dev/null 2>&1 || true
   fi
 fi
