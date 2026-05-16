@@ -419,8 +419,11 @@ done
 # full host filesystem without caching issues.
 if [[ "${DOCKER_HOST:-}" == */.colima/* ]]; then
   log "flushing state for colima..."
+  # Flush state dir files
   tar -cf - -C "${STATE_DIR}" CLAUDE.md .credentials.json .claude.json settings.json 2>/dev/null \
     | docker run --rm -i --entrypoint tar -v "${STATE_DIR}:/_state" "${IMAGE}" -xf - -C /_state 2>/dev/null || true
+  # Warm the project sessions dir so the override mount works
+  docker run --rm --entrypoint ls -v "${HOST_PROJECT_SESSIONS}:/_sessions" "${IMAGE}" /_sessions >/dev/null 2>&1 || true
 fi
 
 # Mount .claude.json (main state) into the container at the home dir level
@@ -471,4 +474,13 @@ docker run --rm "${TTY_FLAGS[@]}" \
   ${env_args[@]+"${env_args[@]}"} \
   -w "${PROJECT_DIR}" \
   "$IMAGE" \
-  --dangerously-skip-permissions "${@:2}"
+  --dangerously-skip-permissions "${@:2}" || true
+
+# Show resume hint.
+set +eo pipefail
+_session=$(find "${HOST_PROJECT_SESSIONS}" "${STATE_DIR}/projects/${PROJECT_SLUG}" \
+           -name "*.jsonl" -maxdepth 1 2>/dev/null | xargs ls -t 2>/dev/null | head -1)
+if [[ -n "$_session" ]]; then
+  _id=$(basename "$_session" .jsonl)
+  printf '\nTo resume this conversation:\n  claude-box %s -r %s\n' "${1:-.}" "$_id" >&2
+fi

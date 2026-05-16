@@ -45,6 +45,11 @@ if [ "$(id -u)" = "0" ] && [ "${HOST_UID}" != "0" ]; then
   mkdir -p "${HOST_HOME}"
   chown "${HOST_UID}:${HOST_GID}" "${HOST_HOME}"
 
+  # Fix ownership on the entire .claude tree. The init container flush and
+  # Docker-created mount points leave root-owned entries that cause EACCES
+  # when Claude Code tries to write sessions, shell env, etc.
+  chown -R "${HOST_UID}:${HOST_GID}" "${HOME}/.claude" 2>/dev/null || true
+
   # Docker Desktop forwards the host ssh-agent at /run/host-services/ssh-auth.sock
   # but the socket inside the container is root-owned. Chown it to the host user
   # so signing/git-over-ssh works without escalation. Silently ignore if absent
