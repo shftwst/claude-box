@@ -190,13 +190,12 @@ for var in "${FORWARD_VARS[@]}"; do
 done
 
 # Concatenate CLAUDE.md files: global base → parent dirs → project (project wins).
-# Content is base64-encoded and passed as an env var so the entrypoint can write
-# it inside the container. This avoids bind-mounting a host file that Colima's
-# virtiofs cache may not have synced to the VM yet.
-_claude_md_content=""
+# Written directly into the state dir so it's part of the main volume mount —
+# no separate bind mount that could fail on Colima when virtiofs hasn't synced.
+: > "${STATE_DIR}/CLAUDE.md"
 
 if [[ -f "${CLAUDE_HOME}/CLAUDE.md" ]]; then
-  _claude_md_content+="$(cat "${CLAUDE_HOME}/CLAUDE.md")"
+  cat "${CLAUDE_HOME}/CLAUDE.md" >> "${STATE_DIR}/CLAUDE.md"
 fi
 
 declare -a claude_files=()
@@ -208,7 +207,8 @@ done
 
 for (( i=${#claude_files[@]}-1; i>=0; i-- )); do
   f="${claude_files[$i]}"
-  _claude_md_content+="$(printf '\n<!-- %s -->\n' "$f"; cat "$f")"
+  printf '\n<!-- %s -->\n' "$f" >> "${STATE_DIR}/CLAUDE.md"
+  cat "$f" >> "${STATE_DIR}/CLAUDE.md"
 done
 
 # Specific ~/.claude entries to bind-mount read-only on top of the state volume.
@@ -353,22 +353,12 @@ done < <(
       done \
     | sort -u
 )
-# Remove stale directory mounts left by previous Colima runs where Docker
-# auto-created directories for nonexistent bind-mount sources.
-for _f in CLAUDE.md .credentials.json; do
-  [[ -d "${STATE_DIR}/${_f}" ]] && rm -rf "${STATE_DIR}/${_f}"
-done
-
-# Extract credentials: try macOS Keychain first, fall back to the state dir
-# (which holds credentials from a previous in-container /login). Passed as an
-# env var so the entrypoint writes it inside the container — avoids virtiofs
-# sync delay on Colima where the VM may not see a freshly-written host file.
+# Extract credentials from macOS Keychain and write to the state dir.
+# Falls back to the state dir copy from a previous in-container /login.
+# On Linux there is no Keychain; Claude Code falls back to ~/.claude/.credentials.json.
 log "reading Claude credentials from keychain..."
-_CREDENTIALS=""
 if KEYCHAIN_CRED=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null); then
-  _CREDENTIALS="$KEYCHAIN_CRED"
-elif [[ -f "${STATE_DIR}/.credentials.json" ]]; then
-  _CREDENTIALS=$(cat "${STATE_DIR}/.credentials.json")
+  echo "$KEYCHAIN_CRED" > "${STATE_DIR}/.credentials.json"
 fi
 
 # Sync host config files into the state dir.
@@ -393,20 +383,41 @@ fs.writeFileSync(dst, JSON.stringify(s, null, 2));
 JSEOF
 
 HOST_SETTINGS="${CLAUDE_HOME}/settings.json"
-_SETTINGS=""
-if [[ -f "$HOST_SETTINGS" ]]; then
-  _SETTINGS=$(node "$_sync_js" settings "$HOST_SETTINGS" /dev/stdout 2>/dev/null) || true
-elif [[ -f "${STATE_DIR}/settings.json" ]]; then
-  _SETTINGS=$(cat "${STATE_DIR}/settings.json")
+STATE_SETTINGS="${STATE_DIR}/settings.json"
+if [[ -f "$HOST_SETTINGS" ]] && { [[ ! -f "$STATE_SETTINGS" ]] || [[ "$HOST_SETTINGS" -nt "$STATE_SETTINGS" ]]; }; then
+  node "$_sync_js" settings "$HOST_SETTINGS" "$STATE_SETTINGS"
 fi
 
 HOST_CLAUDE_JSON="${HOME}/.claude.json"
-_CLAUDE_JSON=""
-if [[ -f "$HOST_CLAUDE_JSON" ]]; then
-  _CLAUDE_JSON=$(node "$_sync_js" passthrough "$HOST_CLAUDE_JSON" /dev/stdout 2>/dev/null) || true
+STATE_CLAUDE_JSON="${STATE_DIR}/.claude.json"
+if [[ -f "$HOST_CLAUDE_JSON" ]] && { [[ ! -f "$STATE_CLAUDE_JSON" ]] || [[ "$HOST_CLAUDE_JSON" -nt "$STATE_CLAUDE_JSON" ]]; }; then
+  node "$_sync_js" passthrough "$HOST_CLAUDE_JSON" "$STATE_CLAUDE_JSON"
 fi
 
 rm -f "$_sync_js"
+
+# Ensure all bind-mount source files exist as actual files. Docker auto-creates
+# nonexistent sources as root-owned directories, which persists in the state dir
+# and breaks subsequent runs (especially on Colima).
+for _f in "$STATE_CLAUDE_JSON" "${STATE_DIR}/CLAUDE.md" "${STATE_DIR}/settings.json" \
+          "${STATE_DIR}/.credentials.json"; do
+  [[ -d "$_f" ]] && rm -rf "$_f"
+  [[ ! -f "$_f" ]] && touch "$_f"
+done
+
+# Colima's virtiofs cache may not expose freshly-written host files to the VM
+# in time for bind mounts. Flush volatile state files through Docker's I/O path
+# by tar-piping them into a lightweight container that writes to the same volume,
+# warming the VM's filesystem cache. Other runtimes skip this — they share the
+# full host filesystem without caching issues.
+if [[ "${DOCKER_HOST:-}" == */.colima/* ]]; then
+  log "flushing state for colima..."
+  tar -cf - -C "${STATE_DIR}" CLAUDE.md .credentials.json .claude.json settings.json 2>/dev/null \
+    | docker run --rm -i --entrypoint tar -v "${STATE_DIR}:/_state" "${IMAGE}" -xf - -C /_state 2>/dev/null || true
+fi
+
+# Mount .claude.json (main state) into the container at the home dir level
+override_mounts+=(-v "${STATE_CLAUDE_JSON}:${HOME}/.claude.json")
 
 # Set the terminal tab/window title to the project name so it's obvious which
 # box this tab belongs to (otherwise it just shows "bash" or "docker"). OSC 0
@@ -432,15 +443,6 @@ fi
 # Mount order matters: state volume first, then specific overrides shadow it
 # for the paths that need to reflect the host (settings, skills, CLAUDE.md).
 # Entrypoint runs as root, creates a hostuser for HOST_UID, then drops to it.
-# Base64-encode volatile content so it can be passed as env vars into the
-# container.  The entrypoint decodes and writes these to the filesystem inside
-# the container, sidestepping Colima's virtiofs cache which may not expose
-# freshly-written host files to the VM in time for docker run's bind mounts.
-_B64_CLAUDE_MD=$(printf '%s' "$_claude_md_content" | base64 | tr -d '\n')
-_B64_CREDENTIALS=$(printf '%s' "$_CREDENTIALS" | base64 | tr -d '\n')
-_B64_CLAUDE_JSON=$(printf '%s' "$_CLAUDE_JSON" | base64 | tr -d '\n')
-_B64_SETTINGS=$(printf '%s' "$_SETTINGS" | base64 | tr -d '\n')
-
 log "starting container..."
 docker run --rm "${TTY_FLAGS[@]}" \
   --name "$CONTAINER_NAME" \
@@ -448,10 +450,6 @@ docker run --rm "${TTY_FLAGS[@]}" \
   -e "HOST_GID=$(id -g)" \
   -e "HOME=${HOME}" \
   -e "SKIP_NPM_PACKAGES_INSTALL=1" \
-  -e "CLAUDE_BOX_CLAUDE_MD=${_B64_CLAUDE_MD}" \
-  -e "CLAUDE_BOX_CREDENTIALS=${_B64_CREDENTIALS}" \
-  -e "CLAUDE_BOX_CLAUDE_JSON=${_B64_CLAUDE_JSON}" \
-  -e "CLAUDE_BOX_SETTINGS=${_B64_SETTINGS}" \
   -e "GIT_CONFIG_COUNT=3" \
   -e "GIT_CONFIG_KEY_0=safe.directory" \
   -e "GIT_CONFIG_VALUE_0=*" \
