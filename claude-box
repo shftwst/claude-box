@@ -356,8 +356,13 @@ done < <(
 # Extract credentials from macOS Keychain and write to the state dir.
 # Falls back to the state dir copy from a previous in-container /login.
 # On Linux there is no Keychain; Claude Code falls back to ~/.claude/.credentials.json.
-log "reading Claude credentials from keychain..."
-if KEYCHAIN_CRED=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null); then
+# Sync credentials into the state dir. Try the host's credentials file first
+# (most common), fall back to macOS Keychain for setups that store tokens there.
+# Copied fresh each run so token refreshes on the host are picked up.
+log "reading Claude credentials..."
+if [[ -f "${CLAUDE_HOME}/.credentials.json" ]]; then
+  cp -f "${CLAUDE_HOME}/.credentials.json" "${STATE_DIR}/.credentials.json"
+elif KEYCHAIN_CRED=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null); then
   echo "$KEYCHAIN_CRED" > "${STATE_DIR}/.credentials.json"
 fi
 
