@@ -138,8 +138,12 @@ STATE_DIR="${HOME}/.claude-box/state"
 mkdir -p "$STATE_DIR"
 chmod 777 "$STATE_DIR"
 
+_SSH_RELAY_PID=""
 cleanup() {
-  rm -f "$tmp_claude_md" 2>/dev/null || true
+  if [[ -n "$_SSH_RELAY_PID" ]]; then
+    kill "$_SSH_RELAY_PID" 2>/dev/null || true
+    wait "$_SSH_RELAY_PID" 2>/dev/null || true
+  fi
 }
 trap cleanup EXIT
 
@@ -185,11 +189,14 @@ for var in "${FORWARD_VARS[@]}"; do
   [[ -n "${!var:-}" ]] && env_args+=(-e "${var}=${!var}")
 done
 
-# Concatenate CLAUDE.md files: global base → parent dirs → project (project wins)
-tmp_claude_md="$(mktemp)"
+# Concatenate CLAUDE.md files: global base → parent dirs → project (project wins).
+# Content is base64-encoded and passed as an env var so the entrypoint can write
+# it inside the container. This avoids bind-mounting a host file that Colima's
+# virtiofs cache may not have synced to the VM yet.
+_claude_md_content=""
 
 if [[ -f "${CLAUDE_HOME}/CLAUDE.md" ]]; then
-  cat "${CLAUDE_HOME}/CLAUDE.md" >> "$tmp_claude_md"
+  _claude_md_content+="$(cat "${CLAUDE_HOME}/CLAUDE.md")"
 fi
 
 declare -a claude_files=()
@@ -201,8 +208,7 @@ done
 
 for (( i=${#claude_files[@]}-1; i>=0; i-- )); do
   f="${claude_files[$i]}"
-  printf '\n<!-- %s -->\n' "$f" >> "$tmp_claude_md"
-  cat "$f" >> "$tmp_claude_md"
+  _claude_md_content+="$(printf '\n<!-- %s -->\n' "$f"; cat "$f")"
 done
 
 # Specific ~/.claude entries to bind-mount read-only on top of the state volume.
@@ -222,19 +228,59 @@ declare -a override_mounts=()
 # the container. Agent forwarding means the host's already-unlocked key is used
 # directly — no passphrase prompt per commit. Skipped if --no-ssh was passed.
 #
-# macOS quirk: Docker Desktop can't bind-mount sockets under
-# /private/tmp/com.apple.launchd.* (the native ssh-agent socket path). It
-# exposes a magic forwarded socket at /run/host-services/ssh-auth.sock that
-# proxies to the host agent; we swap to that path when the launchd pattern is
-# detected. 1Password's socket (~/.1password/agent.sock) is a regular file and
-# mounts directly without needing the magic path.
+# macOS socket paths vary by runtime:
+#   - Docker Desktop: can't bind-mount /private/tmp/com.apple.launchd.* sockets
+#     but exposes a magic /run/host-services/ssh-auth.sock proxy.
+#   - Colima: virtiofs can't expose Unix sockets at all. We relay the host agent
+#     over TCP (Python on host → socat in container) so the container gets a
+#     working SSH_AUTH_SOCK without needing the VM to see the socket file.
+#   - OrbStack: full macOS filesystem access, all paths work directly.
+# 1Password's socket (~/.1password/agent.sock) is under $HOME and works everywhere.
 if [[ $NO_SSH -eq 0 ]]; then
   [[ -d "${HOME}/.ssh" ]] && override_mounts+=(-v "${HOME}/.ssh:${HOME}/.ssh:ro")
-  if [[ -n "${SSH_AUTH_SOCK:-}" ]]; then
-    if [[ "$SSH_AUTH_SOCK" == /private/tmp/com.apple.launchd.* ]]; then
+  if [[ -n "${SSH_AUTH_SOCK:-}" && -S "$SSH_AUTH_SOCK" ]]; then
+    if [[ "${DOCKER_HOST:-}" == */.colima/* ]]; then
+      # Colima: start a TCP relay on the host that proxies to the agent socket.
+      # The container's entrypoint converts it back to a Unix socket via socat.
+      # We write the port to a temp file instead of capturing stdout via $()
+      # because $(cmd &) hangs waiting for the pipe to drain and $! inside $()
+      # doesn't propagate to the parent shell.
+      _relay_port_file=$(mktemp /tmp/claude-box-relay.XXXXXX)
+      python3 -c "
+import socket, sys, threading, signal, os
+src = '${SSH_AUTH_SOCK}'
+server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind(('127.0.0.1', 0))
+port = server.getsockname()[1]
+with open('${_relay_port_file}', 'w') as f:
+    f.write(str(port))
+server.listen(8)
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+def relay(a, b):
+    try:
+        while d := a.recv(4096): b.sendall(d)
+    except: pass
+    finally: a.close(); b.close()
+while True:
+    c, _ = server.accept()
+    u = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    u.connect(src)
+    threading.Thread(target=relay, args=(c, u), daemon=True).start()
+    threading.Thread(target=relay, args=(u, c), daemon=True).start()
+" &
+      _SSH_RELAY_PID=$!
+      sleep 0.3
+      _RELAY_PORT=$(<"$_relay_port_file")
+      rm -f "$_relay_port_file"
+      env_args+=(-e "CLAUDE_BOX_SSH_RELAY_PORT=${_RELAY_PORT}")
+      env_args+=(--add-host "host.docker.internal:host-gateway")
+    elif [[ "$SSH_AUTH_SOCK" == /private/tmp/com.apple.launchd.* ]]; then
+      # Docker Desktop can't mount launchd sockets — use its built-in proxy
       override_mounts+=(-v "/run/host-services/ssh-auth.sock:/run/host-services/ssh-auth.sock")
       env_args+=(-e "SSH_AUTH_SOCK=/run/host-services/ssh-auth.sock")
-    elif [[ -S "$SSH_AUTH_SOCK" ]]; then
+    else
+      # OrbStack and Linux: mount the socket directly
       override_mounts+=(-v "${SSH_AUTH_SOCK}:${SSH_AUTH_SOCK}")
       env_args+=(-e "SSH_AUTH_SOCK=${SSH_AUTH_SOCK}")
     fi
@@ -307,14 +353,22 @@ done < <(
       done \
     | sort -u
 )
-touch "${STATE_DIR}/CLAUDE.md"
-override_mounts+=(-v "${tmp_claude_md}:${CLAUDE_HOME}/CLAUDE.md:ro")
+# Remove stale directory mounts left by previous Colima runs where Docker
+# auto-created directories for nonexistent bind-mount sources.
+for _f in CLAUDE.md .credentials.json; do
+  [[ -d "${STATE_DIR}/${_f}" ]] && rm -rf "${STATE_DIR}/${_f}"
+done
 
-# Extract credentials from macOS Keychain and write to the state dir.
-# On Linux there is no Keychain; Claude Code falls back to ~/.claude/.credentials.json.
+# Extract credentials: try macOS Keychain first, fall back to the state dir
+# (which holds credentials from a previous in-container /login). Passed as an
+# env var so the entrypoint writes it inside the container — avoids virtiofs
+# sync delay on Colima where the VM may not see a freshly-written host file.
 log "reading Claude credentials from keychain..."
+_CREDENTIALS=""
 if KEYCHAIN_CRED=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null); then
-  echo "$KEYCHAIN_CRED" > "${STATE_DIR}/.credentials.json"
+  _CREDENTIALS="$KEYCHAIN_CRED"
+elif [[ -f "${STATE_DIR}/.credentials.json" ]]; then
+  _CREDENTIALS=$(cat "${STATE_DIR}/.credentials.json")
 fi
 
 # Sync host config files into the state dir.
@@ -339,21 +393,20 @@ fs.writeFileSync(dst, JSON.stringify(s, null, 2));
 JSEOF
 
 HOST_SETTINGS="${CLAUDE_HOME}/settings.json"
-STATE_SETTINGS="${STATE_DIR}/settings.json"
-if [[ -f "$HOST_SETTINGS" ]] && { [[ ! -f "$STATE_SETTINGS" ]] || [[ "$HOST_SETTINGS" -nt "$STATE_SETTINGS" ]]; }; then
-  node "$_sync_js" settings "$HOST_SETTINGS" "$STATE_SETTINGS"
+_SETTINGS=""
+if [[ -f "$HOST_SETTINGS" ]]; then
+  _SETTINGS=$(node "$_sync_js" settings "$HOST_SETTINGS" /dev/stdout 2>/dev/null) || true
+elif [[ -f "${STATE_DIR}/settings.json" ]]; then
+  _SETTINGS=$(cat "${STATE_DIR}/settings.json")
 fi
 
 HOST_CLAUDE_JSON="${HOME}/.claude.json"
-STATE_CLAUDE_JSON="${STATE_DIR}/.claude.json"
-if [[ -f "$HOST_CLAUDE_JSON" ]] && { [[ ! -f "$STATE_CLAUDE_JSON" ]] || [[ "$HOST_CLAUDE_JSON" -nt "$STATE_CLAUDE_JSON" ]]; }; then
-  node "$_sync_js" passthrough "$HOST_CLAUDE_JSON" "$STATE_CLAUDE_JSON"
+_CLAUDE_JSON=""
+if [[ -f "$HOST_CLAUDE_JSON" ]]; then
+  _CLAUDE_JSON=$(node "$_sync_js" passthrough "$HOST_CLAUDE_JSON" /dev/stdout 2>/dev/null) || true
 fi
 
 rm -f "$_sync_js"
-
-# Mount .claude.json (main state) into the container at the home dir level
-override_mounts+=(-v "${STATE_CLAUDE_JSON}:${HOME}/.claude.json")
 
 # Set the terminal tab/window title to the project name so it's obvious which
 # box this tab belongs to (otherwise it just shows "bash" or "docker"). OSC 0
@@ -379,6 +432,15 @@ fi
 # Mount order matters: state volume first, then specific overrides shadow it
 # for the paths that need to reflect the host (settings, skills, CLAUDE.md).
 # Entrypoint runs as root, creates a hostuser for HOST_UID, then drops to it.
+# Base64-encode volatile content so it can be passed as env vars into the
+# container.  The entrypoint decodes and writes these to the filesystem inside
+# the container, sidestepping Colima's virtiofs cache which may not expose
+# freshly-written host files to the VM in time for docker run's bind mounts.
+_B64_CLAUDE_MD=$(printf '%s' "$_claude_md_content" | base64 | tr -d '\n')
+_B64_CREDENTIALS=$(printf '%s' "$_CREDENTIALS" | base64 | tr -d '\n')
+_B64_CLAUDE_JSON=$(printf '%s' "$_CLAUDE_JSON" | base64 | tr -d '\n')
+_B64_SETTINGS=$(printf '%s' "$_SETTINGS" | base64 | tr -d '\n')
+
 log "starting container..."
 docker run --rm "${TTY_FLAGS[@]}" \
   --name "$CONTAINER_NAME" \
@@ -386,6 +448,10 @@ docker run --rm "${TTY_FLAGS[@]}" \
   -e "HOST_GID=$(id -g)" \
   -e "HOME=${HOME}" \
   -e "SKIP_NPM_PACKAGES_INSTALL=1" \
+  -e "CLAUDE_BOX_CLAUDE_MD=${_B64_CLAUDE_MD}" \
+  -e "CLAUDE_BOX_CREDENTIALS=${_B64_CREDENTIALS}" \
+  -e "CLAUDE_BOX_CLAUDE_JSON=${_B64_CLAUDE_JSON}" \
+  -e "CLAUDE_BOX_SETTINGS=${_B64_SETTINGS}" \
   -e "GIT_CONFIG_COUNT=3" \
   -e "GIT_CONFIG_KEY_0=safe.directory" \
   -e "GIT_CONFIG_VALUE_0=*" \
