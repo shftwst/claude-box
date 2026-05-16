@@ -62,4 +62,9 @@ RUN npm install -g @anthropic-ai/claude-code \
 COPY entrypoint.sh /usr/local/bin/claude-box-entrypoint.sh
 RUN chmod +x /usr/local/bin/claude-box-entrypoint.sh
 
+# Bake the claude-box theme into the image so it's available regardless of
+# host mounts or virtiofs cache state. The entrypoint copies it into the
+# user's themes dir at startup.
+COPY claude-box-theme.json /usr/local/share/claude-box-theme.json
+
 ENTRYPOINT ["/usr/local/bin/claude-box-entrypoint.sh"]

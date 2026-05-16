@@ -23,6 +23,10 @@ for _stale in "${HOME}/.claude/CLAUDE.md" "${HOME}/.claude/.credentials.json" \
   [ -d "$_stale" ] && rm -rf "$_stale"
 done
 
+# Install the baked-in claude-box theme so the container is visually distinct.
+mkdir -p "${HOME}/.claude/themes"
+cp -f /usr/local/share/claude-box-theme.json "${HOME}/.claude/themes/claude-box.json" 2>/dev/null || true
+
 echo "[entrypoint] starting..." >&2
 if [ "$(id -u)" = "0" ] && [ "${HOST_UID}" != "0" ]; then
   echo "[entrypoint] creating user UID=${HOST_UID} GID=${HOST_GID}..." >&2

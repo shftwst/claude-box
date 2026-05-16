@@ -378,6 +378,8 @@ if (mode === 'settings') {
   if (s.statusLine && s.statusLine.command) {
     s.statusLine.command = s.statusLine.command.replace(/\/opt\/homebrew\/bin\/bun/g, '/usr/local/bin/bun');
   }
+  // Use the claude-box theme so the container is visually distinct from host Claude.
+  s.theme = 'custom:claude-box';
 }
 fs.writeFileSync(dst, JSON.stringify(s, null, 2));
 JSEOF

@@ -1,0 +1,22 @@
+{
+  "name": "claude-box",
+  "base": "dark",
+  "overrides": {
+    "claude": "#ff6b6b",
+    "claudeShimmer": "#ffd93d",
+    "promptBorder": "#6bcb77",
+    "text": "#e8e8e8",
+    "suggestion": "#4d96ff",
+    "permission": "#ff6bcb",
+    "success": "#6bcb77",
+    "error": "#ff6b6b",
+    "warning": "#ffd93d",
+    "planMode": "#c084fc",
+    "autoAccept": "#4d96ff",
+    "bashBorder": "#ffd93d",
+    "diffAdded": "#6bcb77",
+    "diffRemoved": "#ff6b6b",
+    "diffAddedWord": "#4ade80",
+    "diffRemovedWord": "#f87171"
+  }
+}
