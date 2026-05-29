@@ -360,17 +360,20 @@ done < <(
       done \
     | sort -u
 )
-# Extract credentials from macOS Keychain and write to the state dir.
-# Falls back to the state dir copy from a previous in-container /login.
-# On Linux there is no Keychain; Claude Code falls back to ~/.claude/.credentials.json.
-# Sync credentials into the state dir. Try the host's credentials file first
-# (most common), fall back to macOS Keychain for setups that store tokens there.
-# Copied fresh each run so token refreshes on the host are picked up.
+# Sync Claude OAuth credentials into the state dir. On macOS the canonical
+# source is the Keychain ("Claude Code-credentials"); ~/.claude/.credentials.json
+# on macOS often holds only MCP OAuth state (no claudeAiOauth block), so
+# trusting the file by existence alone overwrites a good state-dir token with
+# garbage. Try Keychain first, then the host file but only if it actually has
+# a claudeAiOauth block. If neither yields one, leave the state file alone so
+# a previous in-container /login survives.
 log "reading Claude credentials..."
-if [[ -f "${CLAUDE_HOME}/.credentials.json" ]]; then
+if KEYCHAIN_CRED=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null) \
+   && [[ "$KEYCHAIN_CRED" == *claudeAiOauth* ]]; then
+  printf '%s\n' "$KEYCHAIN_CRED" > "${STATE_DIR}/.credentials.json"
+elif [[ -f "${CLAUDE_HOME}/.credentials.json" ]] \
+     && grep -q '"claudeAiOauth"' "${CLAUDE_HOME}/.credentials.json" 2>/dev/null; then
   cp -f "${CLAUDE_HOME}/.credentials.json" "${STATE_DIR}/.credentials.json"
-elif KEYCHAIN_CRED=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null); then
-  echo "$KEYCHAIN_CRED" > "${STATE_DIR}/.credentials.json"
 fi
 
 # Sync host config files into the state dir.
