@@ -270,11 +270,23 @@ while True:
     threading.Thread(target=relay, args=(u, c), daemon=True).start()
 " &
       _SSH_RELAY_PID=$!
-      sleep 0.3
-      _RELAY_PORT=$(<"$_relay_port_file")
+      # Poll until the relay writes its port (up to 3 s). A fixed sleep raced
+      # against Python startup — if the read beat the write, the container got
+      # an empty CLAUDE_BOX_SSH_RELAY_PORT and no SSH_AUTH_SOCK.
+      _RELAY_PORT=""
+      for _i in $(seq 1 30); do
+        [[ -s "$_relay_port_file" ]] && { _RELAY_PORT=$(<"$_relay_port_file"); break; }
+        sleep 0.1
+      done
       rm -f "$_relay_port_file"
-      env_args+=(-e "CLAUDE_BOX_SSH_RELAY_PORT=${_RELAY_PORT}")
-      env_args+=(--add-host "host.docker.internal:host-gateway")
+      if [[ -z "$_RELAY_PORT" ]]; then
+        log "warning: SSH agent relay failed to start — signing will not work"
+        kill "$_SSH_RELAY_PID" 2>/dev/null || true
+        _SSH_RELAY_PID=""
+      else
+        env_args+=(-e "CLAUDE_BOX_SSH_RELAY_PORT=${_RELAY_PORT}")
+        env_args+=(--add-host "host.docker.internal:host-gateway")
+      fi
     elif [[ "$SSH_AUTH_SOCK" == /private/tmp/com.apple.launchd.* ]]; then
       # Docker Desktop can't mount launchd sockets — use its built-in proxy
       override_mounts+=(-v "/run/host-services/ssh-auth.sock:/run/host-services/ssh-auth.sock")
