@@ -145,7 +145,92 @@ cleanup() {
     wait "$_SSH_RELAY_PID" 2>/dev/null || true
   fi
 }
-trap cleanup EXIT
+
+# First positional arg names the project (defaults to "."); captured here so the
+# resume hint in sync_back() — where $1 would be the function's arg, not the
+# script's — still prints the dir the user launched with.
+_PROJECT_ARG="${1:-.}"
+
+# Flush sessions, credentials, and satellite state from the container back to the
+# host, write any refreshed token back to the Keychain, and print the resume
+# hint. Runs from the EXIT trap (and via the signal traps below), so a DROPPED
+# session — terminal/SSH close, sleep, kill — flushes to the host's native Claude
+# dir and gets the Colima virtiofs coherence pass exactly like a clean exit,
+# instead of stranding the transcript in the state dir. The helper container
+# works over the state volume, so it doesn't need the (already --rm'd) session
+# container. Guarded to run at most once, and only if the container was launched.
+_LAUNCHED=0
+_SYNCED=0
+sync_back() {
+  [[ "${_LAUNCHED:-0}" == 1 && "${_SYNCED:-0}" == 0 ]] || return 0
+  _SYNCED=1
+  set +euo pipefail
+  _state_proj="${STATE_DIR}/projects/${PROJECT_SLUG}"
+
+  # On Colima, files written by the container may not be visible on the host due
+  # to virtiofs caching. Copy them out through Docker's I/O path via a helper
+  # container — the host can't see them directly.
+  if [[ "${DOCKER_HOST:-}" == */.colima/* ]]; then
+    log "syncing state back from colima..."
+    _cid=$(docker create --entrypoint sleep -v "${STATE_DIR}:/_state:rw" "${IMAGE}" 1 2>/dev/null)
+    if [[ -n "$_cid" ]]; then
+      # Sessions, .claude.json, credentials, and satellite state (tasks, todos, etc.)
+      docker cp "${_cid}:/_state/projects/${PROJECT_SLUG}/." "${_state_proj}/" 2>/dev/null || true
+      docker cp "${_cid}:/_state/.claude.json" "${STATE_DIR}/.claude.json" 2>/dev/null || true
+      docker cp "${_cid}:/_state/.credentials.json" "${STATE_DIR}/.credentials.json" 2>/dev/null || true
+      for _sat in tasks session-env shell-snapshots paste-cache plans file-history; do
+        docker cp "${_cid}:/_state/${_sat}/." "${STATE_DIR}/${_sat}/" 2>/dev/null || true
+      done
+      docker rm -f "$_cid" >/dev/null 2>&1 || true
+    fi
+  fi
+
+  # Write an in-box token refresh back to the macOS Keychain so host Claude — and
+  # the next launch's seed — pick it up instead of re-seeding a now-rotated (dead)
+  # refresh token, the usual cause of intermittent logouts. Newer-wins by
+  # expiresAt so a concurrent host refresh isn't clobbered. Only updates an
+  # existing Keychain item (never creates a duplicate) and only for a real
+  # claudeAiOauth token.
+  if command -v security >/dev/null 2>&1 \
+     && [[ -s "${STATE_DIR}/.credentials.json" ]] \
+     && grep -q '"claudeAiOauth"' "${STATE_DIR}/.credentials.json" 2>/dev/null; then
+    _state_exp=$(_cred_expiry < "${STATE_DIR}/.credentials.json")
+    _kc_exp=0
+    if _kc_now=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null) \
+       && [[ "$_kc_now" == *claudeAiOauth* ]]; then
+      _kc_exp=$(printf '%s' "$_kc_now" | _cred_expiry)
+    fi
+    _kc_acct=$(security find-generic-password -s "Claude Code-credentials" 2>/dev/null \
+      | sed -n 's/^[[:space:]]*"acct"<blob>="\(.*\)"$/\1/p')
+    if [[ -n "$_kc_acct" && "${_state_exp:-0}" -gt "${_kc_exp:-0}" ]]; then
+      security add-generic-password -U -s "Claude Code-credentials" -a "$_kc_acct" \
+        -w "$(cat "${STATE_DIR}/.credentials.json")" 2>/dev/null \
+        && log "synced refreshed Claude token back to Keychain" || true
+    fi
+  fi
+
+  # Copy sessions to the host's Claude project dir for cross-tool resumability.
+  cp -f "${_state_proj}/"*.jsonl "$HOST_PROJECT_SESSIONS/" 2>/dev/null
+  cp -rf "${_state_proj}/"*/ "$HOST_PROJECT_SESSIONS/" 2>/dev/null
+
+  _latest=""
+  for f in "${HOST_PROJECT_SESSIONS}/"*.jsonl; do
+    [[ -f "$f" ]] && { [[ -z "$_latest" || "$f" -nt "$_latest" ]] && _latest="$f"; }
+  done
+  if [[ -n "$_latest" ]]; then
+    _id=$(basename "$_latest" .jsonl)
+    printf '[claude-box] to resume: claude-box %s -r %s\n' "${_PROJECT_ARG}" "$_id" >&2
+  fi
+}
+
+# Run sync_back on any exit, and convert a closed terminal (HUP), kill (TERM), or
+# Ctrl-C during the sync phase (INT) into a graceful exit so it still fires. A
+# pending signal trap runs the instant `docker run` returns, so sync_back must
+# already be defined by then — hence it lives here, above the run. During the
+# interactive `docker run -it` the PTY is in raw mode, so the user's in-Claude
+# Ctrl-C goes to the container, not to this launcher.
+trap 'sync_back; cleanup' EXIT
+trap 'exit' INT TERM HUP
 
 # Per-project overrides: source ${PROJECT_DIR}/.env.claude-box if present so
 # each project can supply its own values (e.g. a project-specific LINEAR_API_KEY)
@@ -548,6 +633,7 @@ fi
 # for the paths that need to reflect the host (settings, skills, CLAUDE.md).
 # Entrypoint runs as root, creates a hostuser for HOST_UID, then drops to it.
 log "starting container..."
+_LAUNCHED=1
 docker run --rm "${TTY_FLAGS[@]}" \
   --name "$CONTAINER_NAME" \
   -e "HOST_UID=$(id -u)" \
@@ -570,64 +656,5 @@ docker run --rm "${TTY_FLAGS[@]}" \
   "$IMAGE" \
   --dangerously-skip-permissions "${@:2}" || true
 
-set +euo pipefail
-# Flush sessions from the VM back to the host. On Colima, files written by the
-# container may not be visible on the host due to virtiofs caching. Copy them
-# out through Docker's I/O path, then into the host project sessions dir.
-_state_proj="${STATE_DIR}/projects/${PROJECT_SLUG}"
-if [[ "${DOCKER_HOST:-}" == */.colima/* ]]; then
-  # Extract session files from the VM via a helper container — the host can't
-  # see them directly due to virtiofs caching.
-  # Extract container-written files from the VM via a helper container — the
-  # host can't see them directly due to virtiofs caching.
-  # Extract container-written state from the VM via a helper container — the
-  # host can't see them directly due to virtiofs caching.
-  log "syncing state back from colima..."
-  _cid=$(docker create --entrypoint sleep -v "${STATE_DIR}:/_state:rw" "${IMAGE}" 1 2>/dev/null)
-  if [[ -n "$_cid" ]]; then
-    # Sessions, .claude.json, credentials, and satellite state (tasks, todos, etc.)
-    docker cp "${_cid}:/_state/projects/${PROJECT_SLUG}/." "${_state_proj}/" 2>/dev/null || true
-    docker cp "${_cid}:/_state/.claude.json" "${STATE_DIR}/.claude.json" 2>/dev/null || true
-    docker cp "${_cid}:/_state/.credentials.json" "${STATE_DIR}/.credentials.json" 2>/dev/null || true
-    for _sat in tasks session-env shell-snapshots paste-cache plans file-history; do
-      docker cp "${_cid}:/_state/${_sat}/." "${STATE_DIR}/${_sat}/" 2>/dev/null || true
-    done
-    docker rm -f "$_cid" >/dev/null 2>&1 || true
-  fi
-fi
-
-# Write an in-box token refresh back to the macOS Keychain so host Claude — and
-# the next launch's seed — pick it up instead of re-seeding a now-rotated (dead)
-# refresh token, the usual cause of intermittent logouts. Newer-wins by
-# expiresAt so a concurrent host refresh isn't clobbered. Only updates an
-# existing Keychain item (never creates a duplicate) and only for a real
-# claudeAiOauth token.
-if command -v security >/dev/null 2>&1 \
-   && [[ -s "${STATE_DIR}/.credentials.json" ]] \
-   && grep -q '"claudeAiOauth"' "${STATE_DIR}/.credentials.json" 2>/dev/null; then
-  _state_exp=$(_cred_expiry < "${STATE_DIR}/.credentials.json")
-  _kc_exp=0
-  if _kc_now=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null) \
-     && [[ "$_kc_now" == *claudeAiOauth* ]]; then
-    _kc_exp=$(printf '%s' "$_kc_now" | _cred_expiry)
-  fi
-  _kc_acct=$(security find-generic-password -s "Claude Code-credentials" 2>/dev/null \
-    | sed -n 's/^[[:space:]]*"acct"<blob>="\(.*\)"$/\1/p')
-  if [[ -n "$_kc_acct" && "${_state_exp:-0}" -gt "${_kc_exp:-0}" ]]; then
-    security add-generic-password -U -s "Claude Code-credentials" -a "$_kc_acct" \
-      -w "$(cat "${STATE_DIR}/.credentials.json")" 2>/dev/null \
-      && log "synced refreshed Claude token back to Keychain" || true
-  fi
-fi
-# Copy sessions to the host's Claude project dir for cross-tool resumability.
-cp -f "${_state_proj}/"*.jsonl "$HOST_PROJECT_SESSIONS/" 2>/dev/null
-cp -rf "${_state_proj}/"*/ "$HOST_PROJECT_SESSIONS/" 2>/dev/null
-
-_latest=""
-for f in "${HOST_PROJECT_SESSIONS}/"*.jsonl; do
-  [[ -f "$f" ]] && { [[ -z "$_latest" || "$f" -nt "$_latest" ]] && _latest="$f"; }
-done
-if [[ -n "$_latest" ]]; then
-  _id=$(basename "$_latest" .jsonl)
-  printf '[claude-box] to resume: claude-box %s -r %s\n' "${1:-.}" "$_id" >&2
-fi
+# The session/credential flush + resume hint run from the EXIT trap (sync_back,
+# defined above), so they fire on a dropped session too — not just a clean exit.
