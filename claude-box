@@ -403,6 +403,12 @@ fi
 mkdir -p "${HOME}/.cache"
 override_mounts+=(-v "${HOME}/.cache:${HOME}/.cache")
 
+# Share ~/.local/bin so tools installed inside the box (pip/uv --user, etc.)
+# survive container exit. The entrypoint puts this on PATH. mkdir -p so Docker
+# doesn't create a root-owned dir when the host has no ~/.local/bin yet.
+mkdir -p "${HOME}/.local/bin"
+override_mounts+=(-v "${HOME}/.local/bin:${HOME}/.local/bin")
+
 # Per-project session sharing: bind-mount just this project's session dir from
 # the host so sessions started in claude-box are resumable from host Claude
 # (and vice versa). Scoped to the current project so other projects' history
@@ -533,6 +539,27 @@ if (mode === 'settings') {
   // Use the claude-box theme so the container is visually distinct from host Claude.
   s.theme = 'custom:claude-box';
 }
+if (mode === 'statusline') {
+  // Refresh ONLY the host's statusLine (the HUD) + theme into the existing state
+  // copy, bun path rewritten — merging into, not replacing, the box's settings.
+  // Runs every launch (bypassing the -nt seed guard) so a host statusLine still
+  // reaches the box after Claude has rewritten the box's settings.json and made
+  // it "newer" than the host. Mirrors the host: sets it when present, removes it
+  // when absent. Bails without writing if the state file is unreadable, so a
+  // transient parse error can't nuke the box's settings.
+  let cur;
+  try { cur = JSON.parse(fs.readFileSync(dst, 'utf8')); } catch { process.exit(0); }
+  if (s.statusLine) {
+    const sl = JSON.parse(JSON.stringify(s.statusLine));
+    if (sl.command) sl.command = sl.command.replace(/\/opt\/homebrew\/bin\/bun/g, '/usr/local/bin/bun');
+    cur.statusLine = sl;
+  } else {
+    delete cur.statusLine;
+  }
+  cur.theme = 'custom:claude-box';
+  fs.writeFileSync(dst, JSON.stringify(cur, null, 2));
+  process.exit(0);
+}
 fs.writeFileSync(dst, JSON.stringify(s, null, 2));
 JSEOF
 
@@ -540,6 +567,15 @@ HOST_SETTINGS="${CLAUDE_HOME}/settings.json"
 STATE_SETTINGS="${STATE_DIR}/settings.json"
 if [[ -f "$HOST_SETTINGS" ]] && { [[ ! -f "$STATE_SETTINGS" ]] || [[ "$HOST_SETTINGS" -nt "$STATE_SETTINGS" ]]; }; then
   node "$_sync_js" settings "$HOST_SETTINGS" "$STATE_SETTINGS"
+fi
+
+# The HUD (statusLine) is host-derived presentation config, so refresh it from
+# the host on EVERY launch — not just on the -nt seed above. Claude rewrites the
+# box's settings.json during a session (theme/model/config), making the state
+# copy permanently "newer" than the host; without this, a host statusLine added
+# or changed afterwards never reaches the box and the HUD silently disappears.
+if [[ -f "$HOST_SETTINGS" && -f "$STATE_SETTINGS" ]]; then
+  node "$_sync_js" statusline "$HOST_SETTINGS" "$STATE_SETTINGS"
 fi
 
 HOST_CLAUDE_JSON="${HOME}/.claude.json"

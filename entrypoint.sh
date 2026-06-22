@@ -11,6 +11,11 @@ HOST_GID="${HOST_GID:-1000}"
 HOST_HOME="${HOME:-/home/hostuser}"
 USERNAME="hostuser"
 
+# Put the user's local bin on PATH. claude is exec'd directly (no login shell
+# sources a profile), so child processes inherit PATH from this env. Covers
+# pip/uv --user installs and anything else dropped in ~/.local/bin.
+export PATH="${HOST_HOME}/.local/bin:${PATH}"
+
 # Clean up stale directories that Docker auto-creates when a bind-mount source
 # doesn't exist. On Colima this is common because virtiofs cache delays can make
 # freshly-written host files invisible to the VM at mount time. These root-owned
