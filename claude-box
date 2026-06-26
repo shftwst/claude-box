@@ -108,6 +108,21 @@ if [[ ! -f "$UPDATE_CHECK_FILE" ]] || \
 fi
 
 PROJECT_DIR="$(cd "${1:-$PWD}" && pwd)"
+
+# Refuse to launch from $HOME (or any ancestor of it). PROJECT_DIR is
+# bind-mounted into the container, so launching from home would mount your
+# entire home directory into the box — a huge attack surface and a lot of
+# virtiofs traffic — and make ${HOME} a virtiofs mount root the entrypoint
+# can't chown (which used to kill the container outright). Runs before any
+# trap/launch, so a bare exit here is clean.
+_home="$(cd "$HOME" 2>/dev/null && pwd)"
+if [[ -n "$_home" && ( "$PROJECT_DIR" == "$_home" || "$_home" == "$PROJECT_DIR"/* ) ]]; then
+  printf '[claude-box] refusing to launch from %s\n' "$PROJECT_DIR" >&2
+  printf '[claude-box] this would bind-mount your entire home directory (%s) into the box.\n' "$_home" >&2
+  printf '[claude-box] cd into a specific project directory and run claude-box from there.\n' >&2
+  exit 1
+fi
+
 CLAUDE_HOME="${HOME}/.claude"
 IMAGE="claude-box"
 DOCKERFILE="${CLAUDE_BOX_DIR}/Dockerfile"
