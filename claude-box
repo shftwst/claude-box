@@ -210,12 +210,25 @@ sync_back() {
   fi
 
   # Copy sessions to the host's Claude project dir for cross-tool resumability.
-  cp -f "${_state_proj}/"*.jsonl "$HOST_PROJECT_SESSIONS/" 2>/dev/null
-  cp -rf "${_state_proj}/"*/ "$HOST_PROJECT_SESSIONS/" 2>/dev/null
+  # Preserve mtimes (-p): the resume hint below picks the just-closed session by
+  # newest mtime, and a plain cp stamps every file with the copy time — which
+  # collapses all sessions to one timestamp and makes the pick arbitrary (it
+  # falls back to glob/alphabetical order, reporting a stale unrelated session).
+  cp -pf "${_state_proj}/"*.jsonl "$HOST_PROJECT_SESSIONS/" 2>/dev/null
+  cp -prf "${_state_proj}/"*/ "$HOST_PROJECT_SESSIONS/" 2>/dev/null
 
+  # Resume hint: the just-closed session is the newest transcript by mtime. Scan
+  # both the synced state dir (authoritative on Colima — docker cp keeps real
+  # mtimes) and the host dir (where the live override-mount writes on other
+  # runtimes) so whichever holds the real session wins even if one copy missed —
+  # that double source is also why the hint still prints on a fresh project when
+  # only one of the two dirs got populated. Skip agent-*.jsonl: those are
+  # subagent sidechains, not resumable sessions.
   _latest=""
-  for f in "${HOST_PROJECT_SESSIONS}/"*.jsonl; do
-    [[ -f "$f" ]] && { [[ -z "$_latest" || "$f" -nt "$_latest" ]] && _latest="$f"; }
+  for f in "${_state_proj}/"*.jsonl "${HOST_PROJECT_SESSIONS}/"*.jsonl; do
+    [[ -f "$f" ]] || continue
+    case "${f##*/}" in agent-*) continue ;; esac
+    [[ -z "$_latest" || "$f" -nt "$_latest" ]] && _latest="$f"
   done
   if [[ -n "$_latest" ]]; then
     _id=$(basename "$_latest" .jsonl)
