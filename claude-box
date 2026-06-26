@@ -232,7 +232,12 @@ sync_back() {
   done
   if [[ -n "$_latest" ]]; then
     _id=$(basename "$_latest" .jsonl)
-    printf '[claude-box] to resume: claude-box %s -r %s\n' "${_PROJECT_ARG}" "$_id" >&2
+    _resume_cmd="claude-box ${_PROJECT_ARG} -r ${_id}"
+    printf '[claude-box] to resume: %s\n' "$_resume_cmd" >&2
+    # Also persist the hint: a dropped session (terminal/SSH closed) runs this
+    # trap with a stderr that's already gone, so the line above is computed and
+    # lost. Stash it so the next launch in this project can surface it.
+    printf '%s\n' "$_resume_cmd" > "${_state_proj}/.last-resume" 2>/dev/null || true
   fi
 }
 
@@ -431,6 +436,15 @@ PROJECT_SLUG="${PROJECT_DIR//\//-}"
 HOST_PROJECT_SESSIONS="${CLAUDE_HOME}/projects/${PROJECT_SLUG}"
 mkdir -p "$HOST_PROJECT_SESSIONS"
 mkdir -p "${STATE_DIR}/projects/${PROJECT_SLUG}"
+
+# Surface the previous run's resume hint if the last session was dropped — its
+# stderr was gone when sync_back printed, so the line never reached the user.
+# Show it once, then clear it so it doesn't linger across future launches.
+_last_resume_file="${STATE_DIR}/projects/${PROJECT_SLUG}/.last-resume"
+if [[ -s "$_last_resume_file" ]]; then
+  log "last session: $(cat "$_last_resume_file")"
+  rm -f "$_last_resume_file" 2>/dev/null || true
+fi
 # On Colima, skip the override mount — the freshly-created host dir isn't
 # visible to the VM, so Docker creates an empty ephemeral directory instead.
 # Sessions fall through to the state dir's projects folder, and we sync them
