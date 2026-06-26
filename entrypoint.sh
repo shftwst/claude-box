@@ -51,9 +51,17 @@ if [ "$(id -u)" = "0" ] && [ "${HOST_UID}" != "0" ]; then
     useradd --non-unique -u "${HOST_UID}" -g "${HOST_GID}" -d "${HOST_HOME}" -s /bin/bash -M "${USERNAME}" 2>/dev/null
   fi
 
-  # Ensure home dir exists and is owned by the host user
+  # Ensure home dir exists and is owned by the host user. Tolerate a chown
+  # failure (|| true): when claude-box is launched from ${HOME} itself, the
+  # wrapper bind-mounts PROJECT_DIR (== ${HOME}) into the container, so ${HOME}
+  # is a virtiofs mount root rather than a plain container-local dir — and
+  # chowning a virtiofs mount root returns EPERM, which under `set -e` aborts
+  # the entrypoint and kills the container before claude ever starts. The
+  # .claude and ssh-socket chowns below already tolerate this; the home chown
+  # must too. Skipping it is safe: a virtiofs home already maps to the host UID,
+  # and the per-path .claude chown below still fixes the dirs claude writes to.
   mkdir -p "${HOST_HOME}"
-  chown "${HOST_UID}:${HOST_GID}" "${HOST_HOME}"
+  chown "${HOST_UID}:${HOST_GID}" "${HOST_HOME}" 2>/dev/null || true
 
   # Fix ownership on the entire .claude tree. The init container flush and
   # Docker-created mount points leave root-owned entries that cause EACCES
