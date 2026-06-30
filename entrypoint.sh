@@ -68,6 +68,34 @@ if [ "$(id -u)" = "0" ] && [ "${HOST_UID}" != "0" ]; then
   # when Claude Code tries to write sessions, shell env, etc.
   chown -R "${HOST_UID}:${HOST_GID}" "${HOME}/.claude" 2>/dev/null || true
 
+  # Grant the host user access to the mounted Docker socket (docker-out-of-docker).
+  # claude-box always bind-mounts /var/run/docker.sock, but the forwarded socket is
+  # root-owned with a host-side group GID that has no name inside the container, so
+  # the unprivileged hostuser can't connect. Without this, anything that shells
+  # `docker`/`docker compose` (faff's env-compose lane, Playwright-in-docker, etc.)
+  # fails with EACCES. gosu applies supplementary groups at exec, so joining the
+  # socket's group here is enough — no escalation at runtime.
+  DOCKER_SOCK="/var/run/docker.sock"
+  if [ -S "$DOCKER_SOCK" ]; then
+    SOCK_GID="$(stat -c '%g' "$DOCKER_SOCK" 2>/dev/null || echo 0)"
+    if [ "$SOCK_GID" = "0" ]; then
+      # Root-owned socket with no usable group: regroup it to the host user's
+      # primary group (same approach as the ssh-auth.sock chown below).
+      echo "[entrypoint] docker.sock is root-owned; regrouping to GID ${HOST_GID}" >&2
+      chgrp "${HOST_GID}" "$DOCKER_SOCK" 2>/dev/null || true
+      chmod g+rw "$DOCKER_SOCK" 2>/dev/null || true
+    elif [ "$SOCK_GID" != "${HOST_GID}" ]; then
+      # Ensure a group with the socket's GID exists, then add hostuser to it.
+      SOCK_GRP="$(getent group "$SOCK_GID" | cut -d: -f1)"
+      if [ -z "$SOCK_GRP" ]; then
+        SOCK_GRP="dockersock"
+        groupadd -g "$SOCK_GID" "$SOCK_GRP" 2>/dev/null || true
+      fi
+      echo "[entrypoint] adding ${USERNAME} to docker.sock group ${SOCK_GRP} (GID ${SOCK_GID})" >&2
+      usermod -aG "$SOCK_GRP" "${USERNAME}" 2>/dev/null || true
+    fi
+  fi
+
   # Docker Desktop forwards the host ssh-agent at /run/host-services/ssh-auth.sock
   # but the socket inside the container is root-owned. Chown it to the host user
   # so signing/git-over-ssh works without escalation. Silently ignore if absent
