@@ -53,6 +53,24 @@ These are consumed by the wrapper before `claude` sees them (position-free, so t
 
 - `--upgrade` — `git pull` the install dir and exit. See [Updating](#updating).
 - `--no-ssh` — skip mounting `~/.ssh` and forwarding the SSH agent. Disables git-over-SSH and commit signing inside the container; useful for sessions that don't touch git remotes.
+- `--ollama <model>` — point Claude Code at an Ollama server instead of the Anthropic API. See [Ollama](#ollama).
+
+## Ollama
+
+Run Claude Code against a local (or remote) Ollama server that exposes the Anthropic-compatible API, mirroring `ollama launch claude --model <model>`:
+
+```bash
+claude-box --ollama qwen3-coder:30b-a3b-q4_K_M
+claude-box . --ollama qwen3-coder:30b-a3b-q4_K_M -c   # combine with other flags
+```
+
+The flag is a command-line override — nothing is baked into `.env.claude-box` — and wires up, inside the container:
+
+- `ANTHROPIC_BASE_URL` from `OLLAMA_HOST` (adding `http://` if the scheme is missing), falling back to `http://localhost:11434`
+- `ANTHROPIC_AUTH_TOKEN=ollama` (a dummy token Ollama ignores but Claude Code requires)
+- `ANTHROPIC_MODEL` and `ANTHROPIC_SMALL_FAST_MODEL` both set to the model you pass
+
+Because the base URL follows `OLLAMA_HOST`, pointing it at a **Tailscale peer** just works — set `OLLAMA_HOST=100.x.y.z:11434` (as your `ollama` CLI already does) and the container reaches it over the normal bridge network. No `--network host` is needed: a container can already route to any address the host can reach, including the tailnet.
 
 ## Extra env vars
 

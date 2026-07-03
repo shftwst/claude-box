@@ -25,6 +25,9 @@
 #                                 (signing/git-over-ssh disabled inside container)
 #   --upgrade                   # git pull the claude-box install dir and exit
 #                                 (next run rebuilds the image if needed)
+#   --ollama <model>            # point Claude Code at an Ollama server's
+#                                 Anthropic-compatible API (base URL from
+#                                 OLLAMA_HOST, e.g. a Tailscale peer)
 #
 # Installation:
 #   git clone https://github.com/shftwst/claude-box ~/claude-box
@@ -59,13 +62,21 @@ check_for_update_in_background() {
 # so the project-dir positional and the claude-flag passthrough stay clean.
 NO_SSH=0
 UPGRADE=0
+OLLAMA_MODEL=""
 declare -a _passthrough=()
-for arg in "$@"; do
-  case "$arg" in
+while [[ $# -gt 0 ]]; do
+  case "$1" in
     --no-ssh) NO_SSH=1 ;;
     --upgrade) UPGRADE=1 ;;
-    *) _passthrough+=("$arg") ;;
+    --ollama)
+      shift
+      OLLAMA_MODEL="${1:-}"
+      [[ -n "$OLLAMA_MODEL" ]] || { printf '[claude-box] --ollama requires a model name\n' >&2; exit 1; }
+      ;;
+    --ollama=*) OLLAMA_MODEL="${1#*=}" ;;
+    *) _passthrough+=("$1") ;;
   esac
+  shift
 done
 set -- "${_passthrough[@]+"${_passthrough[@]}"}"
 
@@ -306,6 +317,27 @@ env_args=()
 for var in "${FORWARD_VARS[@]}"; do
   [[ -n "${!var:-}" ]] && env_args+=(-e "${var}=${!var}")
 done
+
+# --ollama <model>: route Claude Code at an Ollama server's Anthropic-compatible
+# API (mirrors `ollama launch claude --model X`). The base URL comes from
+# OLLAMA_HOST so it follows wherever that already points — a Tailscale peer, a
+# LAN box, or localhost — all reachable from the container over the normal
+# bridge network (no host networking needed). OLLAMA_HOST may omit the scheme
+# (Ollama's own convention), so add http:// when absent. ANTHROPIC_AUTH_TOKEN is
+# a dummy Ollama ignores but Claude Code requires to be non-empty. Both the main
+# and small/fast models point at the same model so background calls don't fall
+# back to a claude-* name the server doesn't have.
+if [[ -n "$OLLAMA_MODEL" ]]; then
+  _ollama_url="${OLLAMA_HOST:-localhost:11434}"
+  [[ "$_ollama_url" == http://* || "$_ollama_url" == https://* ]] || _ollama_url="http://${_ollama_url}"
+  env_args+=(
+    -e "ANTHROPIC_BASE_URL=${_ollama_url}"
+    -e "ANTHROPIC_AUTH_TOKEN=ollama"
+    -e "ANTHROPIC_MODEL=${OLLAMA_MODEL}"
+    -e "ANTHROPIC_SMALL_FAST_MODEL=${OLLAMA_MODEL}"
+  )
+  log "ollama mode: ${_ollama_url} (model: ${OLLAMA_MODEL})"
+fi
 
 # Concatenate CLAUDE.md files: global base → parent dirs → project (project wins).
 # Written directly into the state dir so it's part of the main volume mount —
