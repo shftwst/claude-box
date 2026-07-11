@@ -68,31 +68,84 @@ if [ "$(id -u)" = "0" ] && [ "${HOST_UID}" != "0" ]; then
   # when Claude Code tries to write sessions, shell env, etc.
   chown -R "${HOST_UID}:${HOST_GID}" "${HOME}/.claude" 2>/dev/null || true
 
-  # Grant the host user access to the mounted Docker socket (docker-out-of-docker).
-  # claude-box always bind-mounts /var/run/docker.sock, but the forwarded socket is
-  # root-owned with a host-side group GID that has no name inside the container, so
-  # the unprivileged hostuser can't connect. Without this, anything that shells
-  # `docker`/`docker compose` (faff's env-compose lane, Playwright-in-docker, etc.)
-  # fails with EACCES. gosu applies supplementary groups at exec, so joining the
-  # socket's group here is enough — no escalation at runtime.
-  DOCKER_SOCK="/var/run/docker.sock"
-  if [ -S "$DOCKER_SOCK" ]; then
-    SOCK_GID="$(stat -c '%g' "$DOCKER_SOCK" 2>/dev/null || echo 0)"
-    if [ "$SOCK_GID" = "0" ]; then
-      # Root-owned socket with no usable group: regroup it to the host user's
-      # primary group (same approach as the ssh-auth.sock chown below).
-      echo "[entrypoint] docker.sock is root-owned; regrouping to GID ${HOST_GID}" >&2
-      chgrp "${HOST_GID}" "$DOCKER_SOCK" 2>/dev/null || true
-      chmod g+rw "$DOCKER_SOCK" 2>/dev/null || true
-    elif [ "$SOCK_GID" != "${HOST_GID}" ]; then
-      # Ensure a group with the socket's GID exists, then add hostuser to it.
-      SOCK_GRP="$(getent group "$SOCK_GID" | cut -d: -f1)"
-      if [ -z "$SOCK_GRP" ]; then
-        SOCK_GRP="dockersock"
-        groupadd -g "$SOCK_GID" "$SOCK_GRP" 2>/dev/null || true
+  # ---- Nested container engine (ADR-0041 decision 3) ----
+  # The cage runs its OWN engine, bounded by the cage. A mounted host socket is
+  # never acceptable: it is root-equivalent control of the host (any process
+  # could start a privileged container and mount the host fs), so the cage
+  # would not be host-isolated at all. Any socket present this early can only
+  # have been mounted in from outside — refuse to start.
+  if [ -S /var/run/docker.sock ]; then
+    echo "[entrypoint] FATAL: /var/run/docker.sock is mounted from the host." >&2
+    echo "[entrypoint] ADR-0041 (decision 3): a mounted host docker socket voids the cage's" >&2
+    echo "[entrypoint] host isolation. Remove the mount (check CLAUDE_BOX_EXTRA_MOUNTS)." >&2
+    exit 1
+  fi
+
+  # CLAUDE_BOX_ENGINE is set by the launcher: rootless (default), rootful
+  # (sysbox or privileged dind — identical in here), or none. The engine's
+  # data root must NOT be the container's overlayfs (overlay-on-overlay is
+  # rejected by the kernel), so the launcher mounts an anonymous volume at
+  # the data-root path for the posture it selected.
+  ENGINE="${CLAUDE_BOX_ENGINE:-none}"
+  ENGINE_LOG="/tmp/claude-box-engine.log"
+  case "$ENGINE" in
+    rootless)
+      # dockerd-rootless (rootlesskit) as the unprivileged host user: the
+      # daemon holds no capabilities in the cage's user namespace, only in
+      # the nested one it creates — authority bounded by the cage. Needs
+      # subuid/subgid ranges for the userns and a private runtime dir.
+      grep -q "^${USERNAME}:" /etc/subuid 2>/dev/null || echo "${USERNAME}:100000:65536" >> /etc/subuid
+      grep -q "^${USERNAME}:" /etc/subgid 2>/dev/null || echo "${USERNAME}:100000:65536" >> /etc/subgid
+      export XDG_RUNTIME_DIR="/run/user/${HOST_UID}"
+      mkdir -p "$XDG_RUNTIME_DIR" /var/lib/claude-box-engine
+      chown "${HOST_UID}:${HOST_GID}" "$XDG_RUNTIME_DIR" /var/lib/claude-box-engine
+      chmod 700 "$XDG_RUNTIME_DIR"
+      echo "[entrypoint] starting rootless nested engine..." >&2
+      gosu "${USERNAME}" env XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR}" HOME="${HOST_HOME}" PATH="${PATH}" \
+        DOCKERD_ROOTLESS_ROOTLESSKIT_NET=slirp4netns \
+        DOCKERD_ROOTLESS_ROOTLESSKIT_PORT_DRIVER=builtin \
+        dockerd-rootless.sh --data-root /var/lib/claude-box-engine \
+        >"$ENGINE_LOG" 2>&1 &
+      export DOCKER_HOST="unix://${XDG_RUNTIME_DIR}/docker.sock"
+      ;;
+    rootful)
+      # Rootful dockerd inside the cage — reached via sysbox (engine bounded
+      # by the sysbox runtime) or --privileged (ADR-0041's named weaker
+      # posture). Default data root /var/lib/docker: sysbox provisions that
+      # exact path itself, and the privileged posture gets an anonymous
+      # volume there from the launcher. The socket it creates is the NESTED
+      # daemon's, not the host's (a host socket was refused above). hostuser
+      # reaches it via the docker group; gosu applies supplementary groups
+      # at exec.
+      echo "[entrypoint] starting rootful nested engine..." >&2
+      dockerd >"$ENGINE_LOG" 2>&1 &
+      usermod -aG docker "${USERNAME}" 2>/dev/null || true
+      export DOCKER_HOST="unix:///var/run/docker.sock"
+      ;;
+    *)
+      ;;
+  esac
+
+  # Block until the engine answers (bounded): the very first thing a session
+  # does may be a docker command, and racing the daemon start loses. On
+  # failure, warn loudly and continue WITHOUT an engine — never fall back to
+  # any other socket; the ambient DOCKER_HOST is the single authority.
+  if [ -n "${DOCKER_HOST:-}" ]; then
+    _engine_ok=0
+    for _i in $(seq 1 80); do
+      if gosu "${USERNAME}" env DOCKER_HOST="${DOCKER_HOST}" docker version >/dev/null 2>&1; then
+        _engine_ok=1
+        break
       fi
-      echo "[entrypoint] adding ${USERNAME} to docker.sock group ${SOCK_GRP} (GID ${SOCK_GID})" >&2
-      usermod -aG "$SOCK_GRP" "${USERNAME}" 2>/dev/null || true
+      sleep 0.25
+    done
+    if [ "$_engine_ok" = 1 ]; then
+      echo "[entrypoint] nested engine ready (${ENGINE}) at ${DOCKER_HOST}" >&2
+    else
+      echo "[entrypoint] WARNING: nested engine (${ENGINE}) not ready after 20s — continuing without one." >&2
+      echo "[entrypoint] engine log tail (${ENGINE_LOG}):" >&2
+      tail -n 20 "$ENGINE_LOG" >&2 2>/dev/null || true
+      unset DOCKER_HOST
     fi
   fi
 
@@ -133,6 +186,13 @@ if [ "$(id -u)" = "0" ] && [ "${HOST_UID}" != "0" ]; then
   echo "[entrypoint] .claude.json:" >&2
   head -c 200 "${HOME}/.claude.json" >&2 2>/dev/null || echo "(missing)" >&2
   echo >&2
+  # Debug/acceptance hook: CLAUDE_BOX_EXEC=1 execs the args as a raw command
+  # instead of claude — used to run docs/cage-engine-acceptance.md in-cage
+  # non-interactively (e.g. `CLAUDE_BOX_EXEC=1 ... bash -c 'docker info'`).
+  if [ -n "${CLAUDE_BOX_EXEC:-}" ]; then
+    echo "[entrypoint] exec (CLAUDE_BOX_EXEC): $*" >&2
+    exec gosu "${USERNAME}" "$@"
+  fi
   echo "[entrypoint] launching claude $*" >&2
   exec gosu "${USERNAME}" claude "$@"
 fi

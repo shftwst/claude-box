@@ -17,6 +17,7 @@ claude-box bridges that gap. It wires up the bind-mounts, credential extraction,
 - Sessions for the current project are written back to `~/.claude/projects/<slug>/` on the host, so a conversation started in claude-box is resumable from host Claude — and vice versa. Session-keyed satellite state (todos, plan-mode drafts, file-edit history) is shared too
 - macOS Keychain credentials are extracted at launch and written to the state dir
 - `settings.json` is synced on first run (stripping sandbox/hooks, rewriting macOS-specific paths)
+- A **nested container engine** runs inside the box (rootless dockerd by default), so `docker` / `docker compose` work in-session without ever exposing the host's docker socket
 
 ## Requirements
 
@@ -54,6 +55,7 @@ These are consumed by the wrapper before `claude` sees them (position-free, so t
 - `--upgrade` — `git pull` the install dir and exit. See [Updating](#updating).
 - `--no-ssh` — skip mounting `~/.ssh` and forwarding the SSH agent. Disables git-over-SSH and commit signing inside the container; useful for sessions that don't touch git remotes.
 - `--ollama <model>` — point Claude Code at an Ollama server instead of the Anthropic API. See [Ollama](#ollama).
+- `--engine <mode>` — nested container engine posture: `auto` (default), `sysbox`, `rootless`, `privileged-dind`, `none`. See [Nested container engine](#nested-container-engine).
 
 ## Ollama
 
@@ -71,6 +73,34 @@ The flag is a command-line override — nothing is baked into `.env.claude-box` 
 - `ANTHROPIC_MODEL` and `ANTHROPIC_SMALL_FAST_MODEL` both set to the model you pass
 
 Because the base URL follows `OLLAMA_HOST`, pointing it at a **Tailscale peer** just works — set `OLLAMA_HOST=100.x.y.z:11434` (as your `ollama` CLI already does) and the container reaches it over the normal bridge network. No `--network host` is needed: a container can already route to any address the host can reach, including the tailnet.
+
+## Nested container engine
+
+The box ships its own container engine *inside* the cage: `docker` and `docker compose` work in-session, but their authority is bounded by the cage. The host's docker socket is **never** mounted — the entrypoint refuses to start if one is present, because a host socket is root-equivalent control of the host and would void the sandbox entirely.
+
+Container engines, selected with `--engine` (or `CLAUDE_BOX_ENGINE_MODE` in `.env.claude-box`):
+
+- `auto` (default) — `sysbox` if the host docker has the sysbox-runc runtime, else `rootless`.
+- `sysbox` — rootful dockerd inside a [sysbox](https://github.com/nestybox/sysbox) container. Strongest posture; requires sysbox installed on the host/VM.
+- `rootless` — rootless dockerd (rootlesskit) running as the unprivileged in-box user. The cage stays non-privileged; the relaxations it needs are `seccomp=unconfined` + `systempaths=unconfined` (rootlesskit must create user namespaces and write `net.ipv4.ip_forward` in its own detached netns), the `/dev/net/tun` + `/dev/fuse` devices, and on apparmor hosts either `apparmor=unconfined` or a tiny `claude-box-engine` profile granting the `userns` permission.
+- `privileged-dind` — rootful dockerd in a `--privileged` cage. This is the weakest option and therefore is explicit opt-in only, the launcher warns, and it should be a last resort.
+- `none` — no engine.
+
+On first launch (per docker host) the `rootless` posture probes for the weakest working relaxation set and caches it in `~/.claude-box/.userns-strategy-*`:
+
+- `plain` — the relaxations above suffice (typical for Docker Desktop / OrbStack).
+- `profile` / `profile-cap` — Ubuntu-lineage kernels (Colima VMs, Ubuntu 23.10+) restrict unprivileged user namespaces via apparmor; the launcher loads the `claude-box-engine` apparmor profile into the VM kernel through a privileged one-shot helper (host-altitude setup by the human-run wrapper — the cage itself never gets that authority), and `profile-cap` additionally adds `CAP_SYS_ADMIN` to the cage's *bounding* set, which the kernel demands for the setuid `newuidmap` helpers there. The cap is latent: unprivileged in-box processes only reach it through those helpers.
+- `cap` — `CAP_SYS_ADMIN` alone (restricted kernel without apparmor mediation).
+
+Delete `~/.claude-box/.userns-strategy-*` to force a re-probe (e.g. after changing docker runtimes).
+
+Engine storage is an anonymous volume, removed when the session ends — nested images don't persist across sessions. To keep a warm image cache, mount a named volume at the engine's data root (one box at a time — concurrent daemons on one data root won't start):
+
+```bash
+CLAUDE_BOX_EXTRA_MOUNTS=("claude-box-engine-cache:/var/lib/claude-box-engine") claude-box
+```
+
+Verification: run the four checks in [docs/cage-engine-acceptance.md](docs/cage-engine-acceptance.md) inside the box. Expect `docker info --format '{{.SecurityOptions}}'` to contain `name=rootless` under the default posture, and `/var/run/docker.sock` to be absent (rootless) or owned by the nested daemon (rootful).
 
 ## Extra env vars
 
@@ -102,7 +132,7 @@ Plain `KEY=value` lines work — no `export` needed. Add `.env.claude-box` to `.
 
 ## Extra mounts
 
-By default the container sees: the project dir, `~/.ssh` (read-only), `~/.claude` skills/plugins/hooks/`.mcp.json` (read-only), and the Docker socket. To expose additional host paths inside the container, set `CLAUDE_BOX_EXTRA_MOUNTS` to an array of `host:container[:opts]` specs:
+By default the container sees: the project dir, `~/.ssh` (read-only), and `~/.claude` skills/plugins/hooks/`.mcp.json` (read-only) — never the host docker socket (a mount at `/var/run/docker.sock` makes the box refuse to start). To expose additional host paths inside the container, set `CLAUDE_BOX_EXTRA_MOUNTS` to an array of `host:container[:opts]` specs:
 
 ```bash
 CLAUDE_BOX_EXTRA_MOUNTS=("$HOME/.aws:$HOME/.aws:ro" "/data:/data") claude-box

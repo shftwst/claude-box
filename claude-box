@@ -28,6 +28,12 @@
 #   --ollama <model>            # point Claude Code at an Ollama server's
 #                                 Anthropic-compatible API (base URL from
 #                                 OLLAMA_HOST, e.g. a Tailscale peer)
+#   --engine <mode>             # nested container engine posture (ADR-0041):
+#                                 auto (default: sysbox if the host runtime
+#                                 has it, else rootless), sysbox, rootless,
+#                                 privileged-dind (named weaker posture),
+#                                 none. The host docker socket is NEVER
+#                                 mounted into the box.
 #
 # Installation:
 #   git clone https://github.com/shftwst/claude-box ~/claude-box
@@ -36,8 +42,10 @@
 
 set -euo pipefail
 
-# Progress logs to stderr, gated on a tty so piped/non-interactive runs stay clean.
-log() { [[ -t 2 ]] && printf '[claude-box] %s\n' "$*" >&2; }
+# Progress logs to stderr, gated on a tty so piped/non-interactive runs stay
+# clean. Must never return nonzero: a bare top-level `log` under set -e would
+# otherwise kill the script whenever stderr isn't a tty.
+log() { [[ ! -t 2 ]] || printf '[claude-box] %s\n' "$*" >&2; }
 
 # Background-check the install dir against its upstream. Detached so the parent
 # never waits and silent on every failure mode (not a repo, no upstream,
@@ -63,6 +71,7 @@ check_for_update_in_background() {
 NO_SSH=0
 UPGRADE=0
 OLLAMA_MODEL=""
+ENGINE_MODE=""
 declare -a _passthrough=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -74,6 +83,12 @@ while [[ $# -gt 0 ]]; do
       [[ -n "$OLLAMA_MODEL" ]] || { printf '[claude-box] --ollama requires a model name\n' >&2; exit 1; }
       ;;
     --ollama=*) OLLAMA_MODEL="${1#*=}" ;;
+    --engine)
+      shift
+      ENGINE_MODE="${1:-}"
+      [[ -n "$ENGINE_MODE" ]] || { printf '[claude-box] --engine requires a mode (auto|sysbox|rootless|privileged-dind|none)\n' >&2; exit 1; }
+      ;;
+    --engine=*) ENGINE_MODE="${1#*=}" ;;
     *) _passthrough+=("$1") ;;
   esac
   shift
@@ -138,6 +153,7 @@ CLAUDE_HOME="${HOME}/.claude"
 IMAGE="claude-box"
 DOCKERFILE="${CLAUDE_BOX_DIR}/Dockerfile"
 ENTRYPOINT_SH="${CLAUDE_BOX_DIR}/entrypoint.sh"
+USERNS_PROBE_SH="${CLAUDE_BOX_DIR}/userns-probe.sh"
 BUILT_MARKER="${HOME}/.claude-box/.built"
 
 CONTAINER_NAME="claude-box-$(basename "$PROJECT_DIR")-$$"
@@ -148,7 +164,8 @@ CONTAINER_NAME="claude-box-$(basename "$PROJECT_DIR")-$$"
 needs_build=0
 if ! docker image inspect "$IMAGE" &>/dev/null; then
   needs_build=1
-elif [[ "$DOCKERFILE" -nt "$BUILT_MARKER" || "$ENTRYPOINT_SH" -nt "$BUILT_MARKER" ]]; then
+elif [[ "$DOCKERFILE" -nt "$BUILT_MARKER" || "$ENTRYPOINT_SH" -nt "$BUILT_MARKER" \
+        || "$USERNS_PROBE_SH" -nt "$BUILT_MARKER" ]]; then
   needs_build=1
 fi
 if [[ $needs_build -eq 1 ]]; then
@@ -289,6 +306,190 @@ if [[ -f "$PROJECT_ENV_FILE" ]]; then
   source "$PROJECT_ENV_FILE"
   set +a
 fi
+
+# Nested container engine posture (ADR-0041 decision 3). The box gets its own
+# engine INSIDE the cage so its authority is bounded by the cage; the host
+# docker socket is never mounted (the entrypoint refuses to start if one is).
+# Ladder: sysbox (best — rootful engine bounded by the sysbox runtime) →
+# rootless dind (default — unprivileged dockerd in a nested userns; needs
+# seccomp/apparmor unconfined on the OUTER container to allow userns + mounts,
+# but adds no capabilities and stays non-privileged) → privileged-dind (the
+# named weaker posture, explicit opt-in only) → none.
+# CLI --engine wins; else CLAUDE_BOX_ENGINE_MODE (env or .env.claude-box);
+# else auto.
+ENGINE_MODE="${ENGINE_MODE:-${CLAUDE_BOX_ENGINE_MODE:-auto}}"
+_host_docker_caps=""
+if [[ "$ENGINE_MODE" != "none" ]]; then
+  # One docker info call answers both: is sysbox-runc a host runtime, and
+  # does the host enforce apparmor (only then is apparmor=unconfined valid —
+  # passing it on a non-apparmor host errors at container create).
+  _host_docker_caps="$(docker info --format '{{.SecurityOptions}} {{range $k, $v := .Runtimes}}{{$k}} {{end}}' 2>/dev/null || true)"
+fi
+case "$ENGINE_MODE" in
+  auto)
+    if [[ "$_host_docker_caps" == *sysbox-runc* ]]; then ENGINE=sysbox; else ENGINE=rootless; fi
+    ;;
+  sysbox)
+    if [[ "$_host_docker_caps" != *sysbox-runc* ]]; then
+      printf '[claude-box] --engine sysbox: host docker has no sysbox-runc runtime (install sysbox first)\n' >&2
+      exit 1
+    fi
+    ENGINE=sysbox
+    ;;
+  rootless|privileged-dind|none) ENGINE="$ENGINE_MODE" ;;
+  *)
+    printf '[claude-box] unknown --engine mode: %s (want auto|sysbox|rootless|privileged-dind|none)\n' "$ENGINE_MODE" >&2
+    exit 1
+    ;;
+esac
+
+# Per-docker-host slug for cache files: probe results are properties of the
+# docker host (VM), so a Colima↔Docker-Desktop switch must not reuse them.
+_dh_slug="$(printf '%s' "${DOCKER_HOST:-default}" | tr -c 'a-zA-Z0-9' '_')"
+
+# Probe whether the host daemon can map a device node into containers; cached
+# per docker host. /dev/fuse backs fuse-overlayfs (the storage fallback on
+# kernels without rootless-overlay2); /dev/net/tun backs slirp4netns (the
+# rootless engine's network). A missing tun device means the rootless engine
+# can't network — surfaced by the entrypoint's ready check.
+_probe_device() {
+  local dev="$1" cache="${HOME}/.claude-box/.device-probe-${1//\//_}-${_dh_slug}"
+  if [[ ! -f "$cache" ]]; then
+    if docker run --rm --entrypoint true --device "$dev" "$IMAGE" >/dev/null 2>&1; then
+      echo yes > "$cache"
+    else
+      echo no > "$cache"
+    fi
+  fi
+  [[ "$(cat "$cache" 2>/dev/null)" == yes ]]
+}
+
+# AppArmor profile granting the cage CAPABLE user namespaces. Ubuntu-lineage
+# kernels (Colima VMs, Ubuntu 23.10+) set apparmor_restrict_unprivileged_userns:
+# an unconfined unprivileged process may create a userns but is stripped of
+# capabilities inside it, which kills rootlesskit. The blessed fix is a profile
+# carrying the `userns,` permission; flags=(unconfined) means it confines
+# nothing else. Loaded via the host's own apparmor_parser (guaranteed present
+# when apparmor is enforced — dockerd needs it for docker-default) through a
+# privileged one-shot helper that nsenters the host mount namespace. That
+# helper is launcher-side HOST-altitude setup by the human-run wrapper — the
+# cage itself never gets this authority.
+_USERNS_PROFILE='abi <abi/4.0>,
+include <tunables/global>
+profile claude-box-engine flags=(unconfined) {
+  userns,
+}'
+
+# Idempotent, ~300ms. Re-run each launch when needed: loaded profiles do not
+# survive a docker-host (VM) reboot.
+_load_userns_profile() {
+  printf '%s\n' "$_USERNS_PROFILE" | docker run --rm -i --privileged --pid=host \
+    --entrypoint nsenter "$IMAGE" -t 1 -m -- sh -c \
+    'cat > /run/claude-box-engine.profile && apparmor_parser -Kr /run/claude-box-engine.profile' \
+    >/dev/null 2>&1
+}
+
+# Run the baked-in userns probe (unshare + parent-side newuidmap, i.e. what
+# rootlesskit does at boot) under candidate security options.
+_userns_probe() {
+  docker run --rm --entrypoint /usr/local/bin/claude-box-userns-probe \
+    --security-opt seccomp=unconfined "$@" "$IMAGE" >/dev/null 2>&1
+}
+
+# Pick the WEAKEST relaxation set that yields a capable nested userns:
+#   plain        seccomp=unconfined (+ apparmor=unconfined on apparmor hosts)
+#   profile      + the claude-box-engine apparmor profile (userns permission)
+#   profile-cap  + CAP_SYS_ADMIN in the bounding set (Ubuntu-restricted kernels
+#                need it for setuid newuidmap's parent-side map write; latent —
+#                unprivileged cage processes only reach it via those helpers)
+#   cap          SYS_ADMIN alone (restricted kernel, no apparmor mediation)
+# Cached per docker host; "unsupported" is never cached so a host fix is
+# picked up on the next launch. Delete ~/.claude-box/.userns-strategy-* to
+# force a re-probe.
+_resolve_userns_strategy() {
+  local cache="${HOME}/.claude-box/.userns-strategy-${_dh_slug}" s="" aa=()
+  if [[ -s "$cache" ]]; then
+    cat "$cache"
+    return 0
+  fi
+  [[ "$_host_docker_caps" == *apparmor* ]] && aa=(--security-opt apparmor=unconfined)
+  if _userns_probe ${aa[@]+"${aa[@]}"}; then
+    s="plain"
+  elif [[ "$_host_docker_caps" == *apparmor* ]] && _load_userns_profile; then
+    if _userns_probe --security-opt apparmor=claude-box-engine; then
+      s="profile"
+    elif _userns_probe --security-opt apparmor=claude-box-engine --cap-add SYS_ADMIN; then
+      s="profile-cap"
+    fi
+  fi
+  if [[ -z "$s" ]] && _userns_probe ${aa[@]+"${aa[@]}"} --cap-add SYS_ADMIN; then
+    s="cap"
+  fi
+  if [[ -n "$s" ]]; then
+    echo "$s" > "$cache"
+    echo "$s"
+  else
+    echo "unsupported"
+  fi
+}
+
+engine_args=()
+case "$ENGINE" in
+  sysbox)
+    # Sysbox provisions the inner engine's storage and devices itself; the
+    # data-root volume below would defeat its uid-shifting, so pass none.
+    engine_args+=(--runtime sysbox-runc -e "CLAUDE_BOX_ENGINE=rootful" --init)
+    log "engine: sysbox (rootful nested dockerd, bounded by sysbox-runc)"
+    ;;
+  rootless)
+    # The anonymous volume at the data root keeps the nested engine's storage
+    # off the container overlayfs (overlay-on-overlay is rejected) — --rm
+    # removes it with the container, so engine state is per-session.
+    # systempaths=unconfined unmasks /proc inside the cage: rootlesskit must
+    # write net.ipv4.ip_forward in its OWN detached netns through /proc/sys,
+    # which docker bind-mounts read-only in every non-privileged container.
+    engine_args+=(
+      --security-opt seccomp=unconfined
+      --security-opt systempaths=unconfined
+      -e "CLAUDE_BOX_ENGINE=rootless"
+      -v /var/lib/claude-box-engine
+      --init
+    )
+    _userns_strategy="$(_resolve_userns_strategy)"
+    case "$_userns_strategy" in
+      plain)
+        [[ "$_host_docker_caps" == *apparmor* ]] && engine_args+=(--security-opt apparmor=unconfined)
+        ;;
+      profile|profile-cap)
+        _load_userns_profile || log "WARNING: apparmor profile load failed — engine may not start"
+        engine_args+=(--security-opt apparmor=claude-box-engine)
+        [[ "$_userns_strategy" == profile-cap ]] && engine_args+=(--cap-add SYS_ADMIN)
+        ;;
+      cap)
+        engine_args+=(--cap-add SYS_ADMIN)
+        ;;
+      unsupported)
+        log "WARNING: this docker host cannot give an unprivileged user a capable user"
+        log "WARNING: namespace, so the rootless nested engine will likely fail to start."
+        log "WARNING: consider sysbox, or '--engine privileged-dind' (ADR-0041's named"
+        log "WARNING: weaker posture), or '--engine none'."
+        [[ "$_host_docker_caps" == *apparmor* ]] && engine_args+=(--security-opt apparmor=unconfined)
+        ;;
+    esac
+    _probe_device /dev/net/tun && engine_args+=(--device /dev/net/tun)
+    _probe_device /dev/fuse && engine_args+=(--device /dev/fuse)
+    log "engine: rootless nested dockerd (userns strategy: ${_userns_strategy})"
+    ;;
+  privileged-dind)
+    log "WARNING: --engine privileged-dind is ADR-0041's named weaker posture —"
+    log "WARNING: a privileged cage weakens host isolation. Prefer sysbox or rootless."
+    engine_args+=(--privileged -e "CLAUDE_BOX_ENGINE=rootful" -v /var/lib/docker --init)
+    ;;
+  none)
+    engine_args+=(-e "CLAUDE_BOX_ENGINE=none")
+    log "engine: none (no container engine inside the box)"
+    ;;
+esac
 
 # Env vars to forward into the container.
 # Add project-specific vars by setting CLAUDE_BOX_EXTRA_VARS, either in your
@@ -760,7 +961,7 @@ docker run --rm "${TTY_FLAGS[@]}" \
   -v "${PROJECT_DIR}:${PROJECT_DIR}" \
   -v "${STATE_DIR}:${CLAUDE_HOME}" \
   ${override_mounts[@]+"${override_mounts[@]}"} \
-  -v /var/run/docker.sock:/var/run/docker.sock \
+  ${engine_args[@]+"${engine_args[@]}"} \
   ${env_args[@]+"${env_args[@]}"} \
   -w "${PROJECT_DIR}" \
   "$IMAGE" \

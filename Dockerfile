@@ -1,6 +1,11 @@
 FROM node:22-bookworm-slim
 
-# System deps + GitHub CLI + Docker CLI (for GitHub MCP server)
+# System deps + GitHub CLI + a full nested container engine (ADR-0041
+# decision 3): the cage gets its OWN dockerd — rootless by default, rootful
+# under sysbox / privileged dind — never a mounted host socket. docker-ce
+# brings dockerd; docker-ce-rootless-extras brings dockerd-rootless.sh +
+# rootlesskit; uidmap/slirp4netns/fuse-overlayfs/iproute2/iptables are the
+# rootless engine's userns, networking, and storage tooling.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git curl ca-certificates gnupg unzip jq openssh-client socat \
     python3 python3-pip python3-venv \
@@ -13,7 +18,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
        | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/debian bookworm stable" \
        | tee /etc/apt/sources.list.d/docker.list \
-    && apt-get update && apt-get install -y gh docker-ce-cli \
+    && apt-get update && apt-get install -y --no-install-recommends gh \
+       docker-ce docker-ce-cli containerd.io \
+       docker-buildx-plugin docker-compose-plugin docker-ce-rootless-extras \
+       uidmap slirp4netns fuse-overlayfs iproute2 iptables kmod procps \
     && rm -rf /var/lib/apt/lists/*
 
 # Chromium runtime libs so Playwright (installed per-project in venvs) can launch
@@ -60,7 +68,8 @@ RUN npm install -g @anthropic-ai/claude-code \
     && npm cache clean --force
 
 COPY entrypoint.sh /usr/local/bin/claude-box-entrypoint.sh
-RUN chmod +x /usr/local/bin/claude-box-entrypoint.sh
+COPY userns-probe.sh /usr/local/bin/claude-box-userns-probe
+RUN chmod +x /usr/local/bin/claude-box-entrypoint.sh /usr/local/bin/claude-box-userns-probe
 
 # Bake the claude-box theme into the image so it's available regardless of
 # host mounts or virtiofs cache state. The entrypoint copies it into the
