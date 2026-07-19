@@ -130,6 +130,27 @@ TURSO_AUTH_TOKEN=ey...
 
 Plain `KEY=value` lines work — no `export` needed. Add `.env.claude-box` to `.gitignore` (or rely on your global `.env.*` ignore) since it holds secrets.
 
+### Cloud CLI auth
+
+The image bundles several deploy/cloud CLIs (`aws`, `flyctl`, `netlify`, `wrangler`, `gh`). Each authenticates non-interactively from a **precise** env var name — forward the ones you need via `CLAUDE_BOX_EXTRA_VARS` (or set them per-project in `.env.claude-box`). The names are load-bearing; the launcher forwards them verbatim, so don't rename them.
+
+| CLI | Env var(s) | Notes |
+| --- | --- | --- |
+| `aws` (AWS CLI v2) | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` | Session token only for temporary creds. `AWS_DEFAULT_REGION` (or `AWS_REGION`) sets the region; `AWS_PROFILE` selects a named profile. |
+| `flyctl` (Fly.io) | `FLY_API_TOKEN` | From `flyctl auth token`. `FLY_ACCESS_TOKEN` is also honored. |
+| `netlify` | `NETLIFY_AUTH_TOKEN` | Personal access token. `NETLIFY_SITE_ID` targets a site without a linked repo. |
+| `wrangler` (Cloudflare) | `CLOUDFLARE_API_TOKEN` | Add `CLOUDFLARE_ACCOUNT_ID` when the token spans multiple accounts. Legacy `CLOUDFLARE_API_KEY` + `CLOUDFLARE_EMAIL` global-key auth also works but prefer a scoped token. |
+| `gh` (GitHub) | `GH_TOKEN` or `GITHUB_TOKEN` | `GITHUB_TOKEN` / `GITHUB_PERSONAL_ACCESS_TOKEN` are already in the default forwarded set. |
+
+Example — forward AWS and Cloudflare creds for a project:
+
+```bash
+# .env.claude-box
+CLAUDE_BOX_EXTRA_VARS=(AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_DEFAULT_REGION CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID)
+```
+
+> **Heads up:** `flyctl` and `wrangler` also fall back to on-disk config (`~/.fly/`, `~/.wrangler/` or `~/.config/.wrangler/`) when the env var is absent. Those paths aren't in the default mount set, so nothing leaks in unless you mount them explicitly — prefer forwarding a scoped token over mounting host credential dirs.
+
 ## Extra mounts
 
 By default the container sees: the project dir, `~/.ssh` (read-only), and `~/.claude` skills/plugins/hooks/`.mcp.json` (read-only) — never the host docker socket (a mount at `/var/run/docker.sock` makes the box refuse to start). To expose additional host paths inside the container, set `CLAUDE_BOX_EXTRA_MOUNTS` to an array of `host:container[:opts]` specs:

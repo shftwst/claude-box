@@ -33,6 +33,26 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpango-1.0-0 libcairo2 libxkbcommon0 \
     && rm -rf /var/lib/apt/lists/*
 
+# AWS CLI v2 — official bundled installer (arch-aware). Netlify CLI ships via
+# npm below; flyctl via its official install script.
+RUN case "$(dpkg --print-architecture)" in \
+        amd64) awscli_arch=x86_64 ;; \
+        arm64) awscli_arch=aarch64 ;; \
+        *) echo "unsupported arch for aws cli" >&2; exit 1 ;; \
+    esac \
+    && curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-${awscli_arch}.zip" -o /tmp/awscliv2.zip \
+    && unzip -q /tmp/awscliv2.zip -d /tmp \
+    && /tmp/aws/install \
+    && rm -rf /tmp/awscliv2.zip /tmp/aws
+
+# flyctl — Fly.io CLI, via the official install script. FLYCTL_INSTALL sets the
+# install prefix so the binary lands on the system PATH.
+RUN curl -fsSL https://fly.io/install.sh | FLYCTL_INSTALL=/usr/local sh
+
+# Netlify CLI + Wrangler (Cloudflare) — npm globals
+RUN npm install -g netlify-cli wrangler \
+    && npm cache clean --force
+
 # uv — fast Python package + venv manager. Used by skills that bootstrap Python
 # deps without polluting system site-packages or hitting PEP 668. Pulled from
 # the official Astral image so we don't curl-pipe-sh.
