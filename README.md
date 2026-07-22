@@ -37,16 +37,17 @@ The image builds automatically on first run (and rebuilds when the Dockerfile ch
 
 ## Usage
 
+`claude-box` always runs in the current directory (the project root) — `cd` into your project first.
+
 ```bash
-claude-box                  # interactive session in current directory
-claude-box /path/to/dir     # interactive session in another directory
-claude-box . -c             # continue most recent session
-claude-box . --resume       # pick a session to resume (interactive picker)
-claude-box . -r <id>        # resume a specific session by ID
-claude-box . -p "..."       # non-interactive prompt (pipe-friendly)
+claude-box                  # interactive session
+claude-box -c               # continue most recent session
+claude-box --resume         # pick a session to resume (interactive picker)
+claude-box -r <id>          # resume a specific session by ID
+claude-box -p "..."         # non-interactive prompt (pipe-friendly)
 ```
 
-All arguments after the first (directory) are passed directly to `claude`.
+Every argument is passed directly to `claude`. Use `--` to force everything after it to `claude`, so a `claude` flag that shares a name with a claude-box flag can still be passed (e.g. `claude-box -- --engine foo`).
 
 ### claude-box flags
 
@@ -63,7 +64,7 @@ Run Claude Code against a local (or remote) Ollama server that exposes the Anthr
 
 ```bash
 claude-box --ollama qwen3-coder:30b-a3b-q4_K_M
-claude-box . --ollama qwen3-coder:30b-a3b-q4_K_M -c   # combine with other flags
+claude-box --ollama qwen3-coder:30b-a3b-q4_K_M -c   # combine with other flags
 ```
 
 The flag is a command-line override — nothing is baked into `.env.claude-box` — and wires up, inside the container:

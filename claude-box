@@ -12,13 +12,19 @@
 # shell env, pastes, plans, file-history) is also shared so resume preserves
 # more than just the transcript.
 #
-# Usage:
-#   claude-box                  # interactive session in current directory
-#   claude-box /path/to/dir     # interactive session in another directory
-#   claude-box . -c             # continue most recent session here
-#   claude-box . --resume       # pick a session to resume (interactive picker)
-#   claude-box . -r <id>        # resume a specific session by ID
-#   claude-box . -p "..."       # non-interactive prompt (pipe-friendly)
+# Always runs in the current directory (the project root). cd into your project
+# first, then:
+#   claude-box                  # interactive session
+#   claude-box -c               # continue most recent session here
+#   claude-box --resume         # pick a session to resume (interactive picker)
+#   claude-box -r <id>          # resume a specific session by ID
+#   claude-box -p "..."         # non-interactive prompt (pipe-friendly)
+#
+# Every argument is passed straight through to claude, so `claude-box --model
+# sonnet`, `claude-box --mcp-config ...`, etc. all work. Use `--` to force
+# everything after it to claude, so a claude flag that shares a name with a
+# claude-box flag can still be passed, e.g. `claude-box -- --engine foo` sends
+# `--engine foo` to claude, not claude-box.
 #
 # claude-box-specific flags (consumed before claude sees them; position-free):
 #   --no-ssh                    # skip ~/.ssh mount and SSH_AUTH_SOCK forwarding
@@ -68,6 +74,9 @@ check_for_update_in_background() {
 
 # Pull claude-box's own flags out of "$@" before anything else looks at args,
 # so the project-dir positional and the claude-flag passthrough stay clean.
+# A literal `--` ends claude-box option parsing: everything after it goes to
+# claude verbatim, so a claude flag that happens to share a name with a
+# claude-box flag (--no-ssh, --upgrade, --ollama, --engine) can still be passed.
 NO_SSH=0
 UPGRADE=0
 OLLAMA_MODEL=""
@@ -75,6 +84,7 @@ ENGINE_MODE=""
 declare -a _passthrough=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --) shift; _passthrough+=("$@"); break ;;
     --no-ssh) NO_SSH=1 ;;
     --upgrade) UPGRADE=1 ;;
     --ollama)
@@ -94,6 +104,10 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 set -- "${_passthrough[@]+"${_passthrough[@]}"}"
+
+# There's no project-dir positional: claude-box always runs in the current
+# directory (the project root). Every remaining arg goes straight to claude.
+declare -a CLAUDE_ARGS=("$@")
 
 # Resolve symlinks so installs via `ln -sf ~/claude-box/claude-box /usr/local/bin/`
 # (or homebrew's /opt/homebrew/bin) still find the Dockerfile in the repo dir.
@@ -133,7 +147,7 @@ if [[ ! -f "$UPDATE_CHECK_FILE" ]] || \
   check_for_update_in_background
 fi
 
-PROJECT_DIR="$(cd "${1:-$PWD}" && pwd)"
+PROJECT_DIR="$(pwd)"
 
 # Refuse to launch from $HOME (or any ancestor of it). PROJECT_DIR is
 # bind-mounted into the container, so launching from home would mount your
@@ -188,11 +202,6 @@ cleanup() {
     wait "$_SSH_RELAY_PID" 2>/dev/null || true
   fi
 }
-
-# First positional arg names the project (defaults to "."); captured here so the
-# resume hint in sync_back() — where $1 would be the function's arg, not the
-# script's — still prints the dir the user launched with.
-_PROJECT_ARG="${1:-.}"
 
 # Flush sessions, credentials, and satellite state from the container back to the
 # host, write any refreshed token back to the Keychain, and print the resume
@@ -275,7 +284,7 @@ sync_back() {
   done
   if [[ -n "$_latest" ]]; then
     _id=$(basename "$_latest" .jsonl)
-    _resume_cmd="claude-box ${_PROJECT_ARG} -r ${_id}"
+    _resume_cmd="claude-box -r ${_id}"
     printf '[claude-box] to resume: %s\n' "$_resume_cmd" >&2
     # Also persist the hint: a dropped session (terminal/SSH closed) runs this
     # trap with a stderr that's already gone, so the line above is computed and
@@ -965,7 +974,7 @@ docker run --rm "${TTY_FLAGS[@]}" \
   ${env_args[@]+"${env_args[@]}"} \
   -w "${PROJECT_DIR}" \
   "$IMAGE" \
-  --dangerously-skip-permissions "${@:2}" || true
+  --dangerously-skip-permissions ${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"} || true
 
 # The session/credential flush + resume hint run from the EXIT trap (sync_back,
 # defined above), so they fire on a dropped session too — not just a clean exit.
