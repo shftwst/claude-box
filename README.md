@@ -131,6 +131,22 @@ TURSO_AUTH_TOKEN=ey...
 
 Plain `KEY=value` lines work — no `export` needed. Add `.env.claude-box` to `.gitignore` (or rely on your global `.env.*` ignore) since it holds secrets.
 
+### Running multiple boxes at once (Claude auth)
+
+By default the box authenticates from your macOS Keychain subscription login, whose OAuth **refresh token is single-use and rotating**. That's fine for one box, but two concurrent boxes each refresh it independently: the auth server sees the same token spent twice, treats it as a leak, and revokes the whole lineage — silently logging *every* box (and often host Claude) out. Re-running `/login` in any one box heals them all, because the credential file is a shared mount — but the logout keeps recurring.
+
+To run boxes concurrently, mint a **long-lived OAuth token** once and let every box share it. Claude Code uses this token as-is and never refreshes it, so there's nothing to race on:
+
+```bash
+# 1. Generate a long-lived token (opens the same browser flow as /login; ~1yr).
+claude setup-token
+
+# 2. Store it in the Keychain under this exact service name (one time).
+security add-generic-password -U -s "Claude Code-oauth-token" -a "$USER" -w "<token-from-step-1>"
+```
+
+From then on the launcher picks it up automatically and injects it as `CLAUDE_CODE_OAUTH_TOKEN` (you'll see `using static OAuth token` in the launch log). An already-exported `CLAUDE_CODE_OAUTH_TOKEN` takes priority over the Keychain item. If neither is present, the box **falls back to the rotating subscription credential** — so single-box use needs no setup and is unchanged. The shared credential mount stays in place either way, so `/login` still propagates across boxes. Re-mint and re-store when the token eventually expires.
+
 ### Cloud CLI auth
 
 The image bundles several deploy/cloud CLIs (`aws`, `flyctl`, `netlify`, `wrangler`, `gh`). Each authenticates non-interactively from a **precise** env var name — forward the ones you need via `CLAUDE_BOX_EXTRA_VARS` (or set them per-project in `.env.claude-box`). The names are load-bearing; the launcher forwards them verbatim, so don't rename them.
