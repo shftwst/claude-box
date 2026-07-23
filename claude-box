@@ -798,6 +798,34 @@ elif [[ "${_state_exp:-0}" -eq 0 ]] && [[ -f "${CLAUDE_HOME}/.credentials.json" 
   cp -f "${CLAUDE_HOME}/.credentials.json" "$_state_cred"
 fi
 
+# Prefer a long-lived OAuth token (from `claude setup-token`) over the rotating
+# subscription refresh token whenever one is available. Claude Code uses the
+# setup-token as-is and never refreshes it, so any number of concurrent boxes can
+# share it safely. The rotating refresh token can't be shared: two boxes refresh
+# it independently, the auth server sees the single-use token spent twice, and
+# revokes the whole lineage — silently logging every box out. CLAUDE_CODE_OAUTH_TOKEN
+# outranks the mounted .credentials.json OAuth block in Claude's auth precedence,
+# so the shared credential mount stays in place — both as the fallback below and
+# to keep /login propagation working — while the env token, when present, is what
+# actually authenticates.
+#
+# Source order: an already-exported CLAUDE_CODE_OAUTH_TOKEN wins; otherwise pull it
+# from a Keychain item the user creates once with the token `claude setup-token`
+# prints:
+#   security add-generic-password -U -s "Claude Code-oauth-token" -a "$USER" -w "<token>"
+# When neither yields a token we inject nothing and fall through to the rotating
+# credential above — single-box behaviour is unchanged.
+if [[ -z "$OLLAMA_MODEL" ]]; then
+  _claude_oauth_token="${CLAUDE_CODE_OAUTH_TOKEN:-}"
+  if [[ -z "$_claude_oauth_token" ]] && command -v security >/dev/null 2>&1; then
+    _claude_oauth_token=$(security find-generic-password -s "Claude Code-oauth-token" -w 2>/dev/null || true)
+  fi
+  if [[ -n "$_claude_oauth_token" ]]; then
+    env_args+=(-e "CLAUDE_CODE_OAUTH_TOKEN=${_claude_oauth_token}")
+    log "using static OAuth token (concurrency-safe; refresh disabled)"
+  fi
+fi
+
 # Sync host config files into the state dir.
 # Only syncs when the host file is newer (first run, or after host update).
 # Claude Code then reads/writes the state-dir copies, keeping container state
