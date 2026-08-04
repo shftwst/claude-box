@@ -37,6 +37,16 @@ cp -f /usr/local/share/claude-box-theme.json "${HOME}/.claude/themes/claude-box.
 [ -d "${HOME}/.gitconfig" ] && rm -rf "${HOME}/.gitconfig"
 [ -f "${HOME}/.claude/.gitconfig" ] && cp -f "${HOME}/.claude/.gitconfig" "${HOME}/.gitconfig" 2>/dev/null || true
 
+# claude-box concatenates all AGENTS.md files (global + parents + project) into
+# the state dir; copy the merged result out to the ~/.agents/AGENTS.md path the
+# global CLAUDE.md tells Claude to read. Clean up a stale dir if Docker created
+# one at the file's target.
+[ -d "${HOME}/.agents/AGENTS.md" ] && rm -rf "${HOME}/.agents/AGENTS.md"
+if [ -s "${HOME}/.claude/.agents/AGENTS.md" ]; then
+  mkdir -p "${HOME}/.agents"
+  cp -f "${HOME}/.claude/.agents/AGENTS.md" "${HOME}/.agents/AGENTS.md" 2>/dev/null || true
+fi
+
 echo "[entrypoint] starting..." >&2
 if [ "$(id -u)" = "0" ] && [ "${HOST_UID}" != "0" ]; then
   echo "[entrypoint] creating user UID=${HOST_UID} GID=${HOST_GID}..." >&2

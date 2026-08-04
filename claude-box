@@ -571,6 +571,31 @@ for (( i=${#claude_files[@]}-1; i>=0; i-- )); do
   cat "$f" >> "${STATE_DIR}/CLAUDE.md"
 done
 
+# Concatenate AGENTS.md the same way: global ~/.agents/AGENTS.md → parent dirs →
+# project (project wins). The user's CLAUDE.md tells Claude to read
+# ~/.agents/AGENTS.md, and projects carry their own AGENTS.md, so the box needs
+# the merged view — not just the global file. Staged in the state dir (the one
+# reliably-synced mount) for the entrypoint to copy out to ~/.agents/AGENTS.md.
+mkdir -p "${STATE_DIR}/.agents"
+: > "${STATE_DIR}/.agents/AGENTS.md"
+
+if [[ -f "${HOME}/.agents/AGENTS.md" ]]; then
+  cat "${HOME}/.agents/AGENTS.md" >> "${STATE_DIR}/.agents/AGENTS.md"
+fi
+
+declare -a agents_files=()
+current="$PROJECT_DIR"
+while [[ "$current" != "/" ]]; do
+  [[ -f "$current/AGENTS.md" ]] && agents_files+=("$current/AGENTS.md")
+  current="$(dirname "$current")"
+done
+
+for (( i=${#agents_files[@]}-1; i>=0; i-- )); do
+  f="${agents_files[$i]}"
+  printf '\n<!-- %s -->\n' "$f" >> "${STATE_DIR}/.agents/AGENTS.md"
+  cat "$f" >> "${STATE_DIR}/.agents/AGENTS.md"
+done
+
 # Specific ~/.claude entries to bind-mount on top of the state volume.
 # Pre-create the mount-point directories/files as host-user-owned so Docker
 # doesn't create them as root (which would leave root-owned paths in STATE_DIR
