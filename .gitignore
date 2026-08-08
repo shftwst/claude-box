@@ -1,3 +1,6 @@
 .DS_Store
-docs/
 .claude/settings.local.json
+
+.faff
+.faffrc.local.yaml
+.env.*

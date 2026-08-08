@@ -45,6 +45,21 @@
 #   git clone https://github.com/shftwst/claude-box ~/claude-box
 #   ln -sf ~/claude-box/claude-box /usr/local/bin/claude-box
 #   # or add ~/claude-box to PATH
+#
+# Exit status (so `claude-box -p …` composes in scripts, CI, and one-shots):
+#   0        the harness (claude) succeeded
+#   1–124    the harness's own exit code, verbatim
+#   125      launcher fault — image missing
+#   126      launcher fault — engine start failed
+#   127      launcher fault — harness not executable
+#   128+     signal deaths, verbatim
+# Every launcher fault also prints `claude-box: fault=<reason> detail="…"` to
+# stderr (unconditionally, even headless), so a caller testing only zero-vs-
+# nonzero keeps working while one needing precision can parse fault=. 125–127
+# follow docker run's own daemon/invoke/not-found vocabulary. A redirected
+# stdout carries only the harness's output — no CRLF, no [entrypoint] lines,
+# nothing from stderr — because a PTY is allocated only when both stdout and
+# stderr are terminals.
 
 set -euo pipefail
 
@@ -52,6 +67,13 @@ set -euo pipefail
 # clean. Must never return nonzero: a bare top-level `log` under set -e would
 # otherwise kill the script whenever stderr isn't a tty.
 log() { [[ ! -t 2 ]] || printf '[claude-box] %s\n' "$*" >&2; }
+
+# Machine-readable launcher-fault line. UNLIKE log(), this is unconditional on
+# the tty: a headless caller relies on it to disambiguate the exit code (see the
+# exit-status contract in the header), so it must reach captured stderr whether
+# or not stderr is a terminal. fault=<reason> is the stable field; detail="…" is
+# human context. Never returns nonzero, so a bare `fault` can't trip set -e.
+fault() { printf 'claude-box: fault=%s detail="%s"\n' "$1" "${2:-}" >&2; return 0; }
 
 # Background-check the install dir against its upstream. Detached so the parent
 # never waits and silent on every failure mode (not a repo, no upstream,
@@ -184,9 +206,21 @@ elif [[ "$DOCKERFILE" -nt "$BUILT_MARKER" || "$ENTRYPOINT_SH" -nt "$BUILT_MARKER
 fi
 if [[ $needs_build -eq 1 ]]; then
   log "building image..."
-  docker build -f "$DOCKERFILE" -t "$IMAGE" "$CLAUDE_BOX_DIR"
+  if ! docker build -f "$DOCKERFILE" -t "$IMAGE" "$CLAUDE_BOX_DIR"; then
+    fault image-missing "docker build failed for image '${IMAGE}'"
+    exit 125
+  fi
   mkdir -p "$(dirname "$BUILT_MARKER")"
   touch "$BUILT_MARKER"
+fi
+
+# The image must exist before we run. If inspect still can't see it — a build
+# skipped as unneeded but the image was removed out-of-band, or a build that
+# produced nothing — that's an image-missing launcher fault (125), caught here
+# (before the container ever launches) so runtime 125s can mean engine failure.
+if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+  fault image-missing "image '${IMAGE}' is not present (build it or check the docker daemon)"
+  exit 125
 fi
 
 # Persistent state dir — preserves settings, conversation history, etc. across
@@ -217,6 +251,19 @@ sync_back() {
   [[ "${_LAUNCHED:-0}" == 1 && "${_SYNCED:-0}" == 0 ]] || return 0
   _SYNCED=1
   set +euo pipefail
+
+  # Never copy out from a container that's still writing to the state volume. On
+  # a headless run no PTY absorbs the signal, so a supervisor's SIGINT/TERM/HUP
+  # can reach this launcher and fire the EXIT trap while the session container is
+  # still live — snapshotting half-flushed state. Stop it (with a short grace so
+  # the harness can flush) and wait before touching the volume. On a clean exit
+  # the container has already `--rm`'d itself, so `docker inspect` misses and
+  # this is a fast no-op — the interactive -it path routed the signal to the
+  # container, not here, so it too arrives with the container already gone.
+  if docker inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
+    docker stop -t 2 "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  fi
+
   _state_proj="${STATE_DIR}/projects/${PROJECT_SLUG}"
 
   # On Colima, files written by the container may not be visible on the host due
@@ -298,7 +345,10 @@ sync_back() {
 # pending signal trap runs the instant `docker run` returns, so sync_back must
 # already be defined by then — hence it lives here, above the run. During the
 # interactive `docker run -it` the PTY is in raw mode, so the user's in-Claude
-# Ctrl-C goes to the container, not to this launcher.
+# Ctrl-C goes to the container, not to this launcher. On a HEADLESS run there's
+# no PTY, so a supervisor's signal lands here while the container may still be
+# live; sync_back stops the container before copying out (see its guard), so the
+# copy-out never races a running container regardless of the signal path.
 trap 'sync_back; cleanup' EXIT
 trap 'exit' INT TERM HUP
 
@@ -340,8 +390,8 @@ case "$ENGINE_MODE" in
     ;;
   sysbox)
     if [[ "$_host_docker_caps" != *sysbox-runc* ]]; then
-      printf '[claude-box] --engine sysbox: host docker has no sysbox-runc runtime (install sysbox first)\n' >&2
-      exit 1
+      fault engine-start-failed "--engine sysbox: host docker has no sysbox-runc runtime (install sysbox first)"
+      exit 126
     fi
     ENGINE=sysbox
     ;;
@@ -520,6 +570,8 @@ FORWARD_VARS=(
   LINEAR_API_KEY
   TERM
   COLORFGBG
+  CLAUDE_BOX_DEBUG   # opt-in entrypoint state dump (off by default)
+  CLAUDE_BOX_EXEC    # acceptance hook: exec the args as a raw command, not claude
   "${CLAUDE_BOX_EXTRA_VARS[@]+"${CLAUDE_BOX_EXTRA_VARS[@]}"}"
 )
 
@@ -991,14 +1043,26 @@ if [[ -t 2 ]]; then
   printf '\e]0;claude-box: %s\a' "$(basename "$PROJECT_DIR")" >&2
 fi
 
-# Allocate a PTY (-t) whenever any of stdin/stdout/stderr is a real TTY. Claude
-# Code's Ink-rendered TUI needs the container's stdout to be a PTY for color +
-# layout detection; without it the welcome banner and status line render as
-# white-on-white with raw ANSI artifacts. Drop -t only in fully piped/autonomous
-# runs (no TTY anywhere) so docker doesn't inject CRLF translation that mangles
-# stdout pipes.
-TTY_FLAGS=(-i)
-if [[ -t 0 || -t 1 || -t 2 ]]; then
+# Compose docker's -i/-t independently from the actual fd shapes.
+#
+# -t (allocate a PTY): only when BOTH stdout and stderr are real terminals.
+# Claude Code's Ink TUI needs a PTY on stdout for color + layout, but a PTY also
+# applies CRLF translation and merges the container's stderr into stdout. So if
+# stdout alone is redirected (`claude-box -p … > out.txt`), gating on any-of-
+# three would still allocate a PTY and corrupt the capture with \r\n and stray
+# [entrypoint] lines. Requiring both stdout and stderr to be ttys means a PTY is
+# used only for genuinely interactive runs, and any redirection drops it.
+#
+# -i (attach stdin): only when something is actually connected to stdin — a
+# terminal, a pipe, or a redirected file. Passing -i unconditionally makes a
+# supervisor that launches us with stdin at /dev/null hand Claude an immediate
+# EOF (interactive Claude then exits at once); omitting -i there leaves stdin
+# unattached, which is correct for a no-stdin invocation.
+TTY_FLAGS=()
+if [[ -t 0 || -p /dev/stdin || -f /dev/stdin || -S /dev/stdin ]]; then
+  TTY_FLAGS+=(-i)
+fi
+if [[ -t 1 && -t 2 ]]; then
   TTY_FLAGS+=(-t)
 fi
 
@@ -1007,6 +1071,7 @@ fi
 # Entrypoint runs as root, creates a hostuser for HOST_UID, then drops to it.
 log "starting container..."
 _LAUNCHED=1
+_rc=0
 docker run --rm "${TTY_FLAGS[@]}" \
   --name "$CONTAINER_NAME" \
   -e "HOST_UID=$(id -u)" \
@@ -1027,7 +1092,29 @@ docker run --rm "${TTY_FLAGS[@]}" \
   ${env_args[@]+"${env_args[@]}"} \
   -w "${PROJECT_DIR}" \
   "$IMAGE" \
-  --dangerously-skip-permissions ${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"} || true
+  --dangerously-skip-permissions ${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"} || _rc=$?
 
 # The session/credential flush + resume hint run from the EXIT trap (sync_back,
 # defined above), so they fire on a dropped session too — not just a clean exit.
+#
+# Map docker run's status to the launcher's exit contract (see header). The
+# harness's own codes pass through verbatim (0, 1–124 and signal deaths 128+);
+# docker's container-lifecycle band becomes a distinguishable launcher fault
+# with a machine-readable reason on stderr. Image-missing was already caught
+# pre-run as 125, so a 125 HERE means the container failed to start with the
+# image present — an engine/runtime rejection (bad posture, denied privileged /
+# security-opt, missing runtime). 126/127 mean docker could not exec the harness
+# (claude not executable / not found). The rare harness that itself exits in
+# 125–127 is misattributed by the code alone — the fault= line, present only on
+# a real launcher fault, is what actually disambiguates.
+case "$_rc" in
+  125)
+    fault engine-start-failed "docker could not create/start the container (check --engine posture and host runtime)"
+    _rc=126
+    ;;
+  126|127)
+    fault harness-not-executable "the container could not exec the harness (claude not found or not executable)"
+    _rc=127
+    ;;
+esac
+exit "$_rc"
