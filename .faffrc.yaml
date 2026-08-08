@@ -1,0 +1,73 @@
+# faff — the harness's OWN repo config (Linear tracker · agile lens · nlspec spec).
+# (Corrected 2026-07-01: previously carried a copied P1-link-shortener SUT / git-only header — a relic.)
+
+tracking:
+    spec_docs_path: docs/specs/ # where graft commits specs (git-only spec store is .faff/specs/)
+    repo: shftwst/claude-box
+
+slots:
+    methodology: faffter-dark-methodology-agile-delivery
+    spec: faffter-dark-nlspec
+    spec_review: faffter-dark-spec-review
+    architecture: faffter-noon-architecture
+    concurrency: faffter-dark-concurrency-parallel
+    env: faffter-noon-env-compose
+    review: faffter-dark-adversarial-review
+    # evaluator (faffter-noon-evaluate) is invoked via the holdout → prdr-coverage path, not an rc slot.
+
+appetite: high
+automation_default: opt-in # fail-safe: a ticket is automatable ONLY when a human adds `faff-automate` in the tracker (the control-plane gesture, FAFF-19/125/218)
+intake_gate: warn
+
+budget:
+    max_attempts: 40 # runaway backstop ONLY (won't bind the scoped bulk slice); NOT the terminator
+    tokens: 3000000000 # 3B runaway backstop (subscription covers the week; catches a true runaway)
+    at_ceiling: escalate # surface a needs-human signal at the ceiling — never silently drain
+    # run-done (dryness) + convergence.max_waves govern the real exit; budget is the backstop.
+
+convergence:
+    enabled: true # within-run convergence on by default: drain execution-discovered scope in-run
+    max_waves: 8 # reported runaway backstop only (dryness is the normal exit, never this)
+
+backends:
+    nvidia-glm:
+        provider: nvidia
+        model: z-ai/glm-5.2
+        host: https://integrate.api.nvidia.com/v1
+        api_key_env: NVIDIA_API_KEY # confirmed set in env (name only; never the key itself)
+        timeout: 480
+    gemini-gemma:
+        provider: gemini
+        model: models/gemma-4-31b-it # /v1beta/openai lists ids models/-prefixed; the served-check is exact-match
+        host: https://generativelanguage.googleapis.com/v1beta/openai
+        api_key_env: GEMINI_API_KEY
+        timeout: 480
+    openrouter:
+        provider: openai                       # OpenRouter is OpenAI-compatible
+        model: nvidia/nemotron-3-ultra-550b-a55b:free
+        host: https://openrouter.ai/api/v1
+        api_key_env: OPENROUTER_API_KEY
+        timeout: 480
+    gemini-gemma-paid:
+        provider: gemini
+        model: models/gemma-4-31b-it # /v1beta/openai lists ids models/-prefixed; the served-check is exact-match
+        host: https://generativelanguage.googleapis.com/v1beta/openai
+        api_key_env: GEMINI_API_KEY_FAFF_PAID
+        timeout: 480
+
+faffter_dark:
+    adversarial: # ordered refs: list — index 0 first-served, no "primary" (FAFF-261/523)
+        deadline: 1440
+        refs:
+            - nvidia-glm
+            - openrouter
+            - gemini-gemma
+            - gemini-gemma-paid
+
+models:
+    build_by_confidence:
+        default: claude-opus-4-8
+        high: sonnet
+        medium: claude-opus-4-8
+    prep_explore: sonnet
+    eval: claude-opus-4-8
