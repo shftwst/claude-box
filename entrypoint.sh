@@ -183,23 +183,35 @@ if [ "$(id -u)" = "0" ] && [ "${HOST_UID}" != "0" ]; then
 
   # gosu does a direct exec as the user — no shell wrapper, proper TTY + signal
   # inheritance for Claude Code's interactive UI.
-  echo "[entrypoint] HOME=${HOME}" >&2
-  echo "[entrypoint] .claude contents:" >&2
-  ls -la "${HOME}/.claude/" >&2 2>/dev/null || echo "(missing)" >&2
-  echo "[entrypoint] .credentials.json:" >&2
-  if [ -f "${HOME}/.claude/.credentials.json" ]; then
-    echo "present ($(wc -c < "${HOME}/.claude/.credentials.json") bytes)" >&2
-  else
-    echo "(missing)" >&2
+  #
+  # State dump is opt-in (CLAUDE_BOX_DEBUG=1), and stays on stderr. It's off by
+  # default because it's noisy and mildly sensitive: it lists ~/.claude, reports
+  # the credential file's byte count, and prints the first 200 bytes of
+  # .claude.json — none of which a headless caller wants merged into its logs.
+  if [ -n "${CLAUDE_BOX_DEBUG:-}" ]; then
+    echo "[entrypoint] HOME=${HOME}" >&2
+    echo "[entrypoint] .claude contents:" >&2
+    ls -la "${HOME}/.claude/" >&2 2>/dev/null || echo "(missing)" >&2
+    echo "[entrypoint] .credentials.json:" >&2
+    if [ -f "${HOME}/.claude/.credentials.json" ]; then
+      echo "present ($(wc -c < "${HOME}/.claude/.credentials.json") bytes)" >&2
+    else
+      echo "(missing)" >&2
+    fi
+    echo >&2
+    echo "[entrypoint] .claude.json:" >&2
+    head -c 200 "${HOME}/.claude.json" >&2 2>/dev/null || echo "(missing)" >&2
+    echo >&2
   fi
-  echo >&2
-  echo "[entrypoint] .claude.json:" >&2
-  head -c 200 "${HOME}/.claude.json" >&2 2>/dev/null || echo "(missing)" >&2
-  echo >&2
   # Debug/acceptance hook: CLAUDE_BOX_EXEC=1 execs the args as a raw command
   # instead of claude — used to run docs/cage-engine-acceptance.md in-cage
   # non-interactively (e.g. `CLAUDE_BOX_EXEC=1 ... bash -c 'docker info'`).
   if [ -n "${CLAUDE_BOX_EXEC:-}" ]; then
+    # The launcher always prepends claude's --dangerously-skip-permissions; drop
+    # a single leading one so EXEC runs the bare command that follows (this is
+    # what makes `CLAUDE_BOX_EXEC=1 claude-box -- bash -c 'exit 7'` exit 7,
+    # exercising the launcher's exit-status propagation end to end).
+    [ "${1:-}" = "--dangerously-skip-permissions" ] && shift
     echo "[entrypoint] exec (CLAUDE_BOX_EXEC): $*" >&2
     exec gosu "${USERNAME}" "$@"
   fi
