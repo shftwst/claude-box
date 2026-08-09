@@ -2,6 +2,7 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
 
 jobs:
@@ -9,7 +10,7 @@ jobs:
     name: static checks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Syntax-check shell scripts
         run: |
           for f in claude-box codex-box libcage.sh entrypoint-cage.sh \
@@ -43,7 +44,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: static
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Build cage-base + both payload images through the real launchers, so the
       # image build path itself is under test. --engine none skips the nested
