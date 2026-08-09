@@ -156,10 +156,24 @@ JSEOF
 # in-box-newer login isn't clobbered by a stale host copy. Also build the merged
 # AGENTS.md into the cage relay — Codex reads AGENTS.md natively.
 box_stage() {
+  # Seed login/config from the host, but NEVER Codex's local runtime database.
+  # logs_*.sqlite is kept open (WAL) by a running host codex, so copying it
+  # in-flight yields a torn file ("file is not a database"), which the box then
+  # rebuilds on every startup. The box keeps its OWN sqlite in the state dir
+  # across runs; only auth.json / config.toml / profiles come from the host.
   if [[ -d "${HOME}/.codex" ]]; then
     log "seeding ~/.codex login/config..."
-    rsync -au "${HOME}/.codex/" "${STATE_DIR}/" 2>/dev/null \
-      || cp -ru "${HOME}/.codex/." "${STATE_DIR}/" 2>/dev/null || true
+    if command -v rsync >/dev/null 2>&1; then
+      rsync -au --exclude='*.sqlite' --exclude='*.sqlite-wal' --exclude='*.sqlite-shm' \
+        --exclude='db-backups/' "${HOME}/.codex/" "${STATE_DIR}/" 2>/dev/null || true
+    else
+      # Minimal fallback (no rsync): just the config/auth files, never the DB.
+      local f
+      for f in auth.json config.toml; do
+        [[ -f "${HOME}/.codex/${f}" ]] && cp -pf "${HOME}/.codex/${f}" "${STATE_DIR}/${f}" 2>/dev/null || true
+      done
+      cp -pf "${HOME}/.codex/"*.config.toml "${STATE_DIR}/" 2>/dev/null || true
+    fi
   fi
 
   # Lift MCP OAuth logins (Linear, etc.) out of the macOS Keychain into the
