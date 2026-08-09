@@ -19,6 +19,37 @@ claude-box bridges that gap. It wires up the bind-mounts, credential extraction,
 - `settings.json` is synced on first run (stripping sandbox/hooks, rewriting macOS-specific paths)
 - A **nested container engine** runs inside the box (rootless dockerd by default), so `docker` / `docker compose` work in-session without ever exposing the host's docker socket
 
+## Architecture: the cage
+
+claude-box is one payload on a shared **cage**. The cage is the isolation
+boundary: it owns the outer container, its security posture, the bounded nested
+engine, uid mapping, the ssh / colima relays, the image build, the exit-status
+contract, and the `docker run` assembly. It knows nothing about which harness
+runs inside it. A payload owns one thing: which harness command runs, and which
+host state it syncs.
+
+- `libcage.sh` — the cage, as a sourced shell library. The engine block, the
+  userns probe ladder, env forwarding, and the `docker run` invocation live here
+  exactly once.
+- `Dockerfile.cage` builds `cage-base`: git, gh, the nested docker engine, and
+  the generic dev tooling, with **no agent harness**. `entrypoint-cage.sh` is its
+  entrypoint (create the host user, start the engine, wire the relays, then exec
+  whatever command the launcher hands it).
+- A payload is a thin wrapper plus a Dockerfile `FROM cage-base`. `claude-box` +
+  `Dockerfile.claude` add Claude Code; `codex-box` + `Dockerfile.codex` add the
+  OpenAI Codex CLI. Each wrapper sets a handful of `BOX_*` variables and may
+  define `box_stage` / `box_sync_back` hooks for its own state, then calls
+  `cage_run "$@"`.
+
+A second payload, **codex-box**, ships alongside claude-box and runs the Codex
+CLI in the same cage (`codex-box` on your `PATH`; state persists in
+`~/.codex-box/state/`, auth from a persisted `codex login`). It exists partly to
+keep the boundary honest: anything Claude-specific that leaks into the cage would
+break Codex.
+
+To verify the boundary and the nested engine, run
+[docs/cage-engine-acceptance.md](docs/cage-engine-acceptance.md).
+
 ## Requirements
 
 - Docker Desktop (or Docker Engine on Linux)
@@ -33,7 +64,7 @@ ln -sf ~/claude-box/claude-box /usr/local/bin/claude-box
 chmod +x ~/claude-box/claude-box
 ```
 
-The image builds automatically on first run (and rebuilds when the Dockerfile changes).
+The images build automatically on first run: a shared `cage-base` first, then the `claude-box` payload image on top of it. Either rebuilds when its own inputs change (see [Architecture](#architecture-the-cage)).
 
 ## Usage
 
@@ -203,7 +234,7 @@ rm -rf ~/.claude-box/state/
 claude-box --upgrade
 ```
 
-This runs `git pull --ff-only` on the install dir and exits. The image rebuilds automatically on the next regular run when the Dockerfile or entrypoint changed.
+This runs `git pull --ff-only` on the install dir and exits. The images rebuild automatically on the next regular run: `cage-base` when `Dockerfile.cage`, `entrypoint-cage.sh`, or `userns-probe.sh` changed, and the `claude-box` payload image when `Dockerfile.claude`, its `payload-init-claude.sh`, the theme, or `cage-base` itself changed.
 
 On startup, claude-box does a backgrounded `git fetch` against the install dir at most once every 24 hours. When the check finds you're behind upstream, the next launch prints a single hint line:
 
