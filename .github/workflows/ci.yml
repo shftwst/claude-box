@@ -72,7 +72,9 @@ jobs:
           docker run --rm --entrypoint sh codex-box  -c 'command -v codex  >/dev/null && ! command -v claude >/dev/null'
           echo "image boundary OK"
 
-      # Part 4 — the exit-status contract holds identically through each wrapper.
+      # Part 4 + headless runbook — the exit-status contract holds identically
+      # through each wrapper: harness status, signal deaths, and an in-box timeout
+      # all propagate verbatim (none of these are launcher faults).
       - name: Exit-status contract
         run: |
           set -euo pipefail
@@ -89,7 +91,10 @@ jobs:
             box="${pair%%:*}"; var="${pair##*:}"
             check "$box" "$var" 0   bash -c 'exit 0'
             check "$box" "$var" 7   bash -c 'exit 7'
-            check "$box" "$var" 130 bash -c 'kill -INT $$'
+            check "$box" "$var" 130 bash -c 'kill -INT $$'    # SIGINT
+            check "$box" "$var" 143 bash -c 'kill -TERM $$'   # SIGTERM
+            check "$box" "$var" 137 bash -c 'kill -KILL $$'   # SIGKILL
+            check "$box" "$var" 124 timeout 1 sleep 5         # in-box timeout
           done
           # stdin round-trips through the cage (proves -i gating).
           out=$(printf 'PING\n' | env CLAUDE_BOX_EXEC=1 "$GITHUB_WORKSPACE/claude-box" --engine none -- cat)
@@ -117,3 +122,69 @@ jobs:
             echo "OK: $box refused host socket (exit $rc)"
           done
           echo "socket refusal OK"
+
+      # Headless runbook — a launcher fault emits a distinct exit code and a
+      # machine-readable stderr line, even with the nested engine disabled. A
+      # create-time failure (a mount docker rejects) is docker 125, remapped to 126.
+      - name: Launcher fault line
+        run: |
+          set -euo pipefail
+          cd /tmp/cbtest
+          printf 'CLAUDE_BOX_EXTRA_MOUNTS=("/tmp:/tmp:bogusmode")\n' > .env.claude-box
+          rc=0
+          CLAUDE_BOX_EXEC=1 "$GITHUB_WORKSPACE/claude-box" --engine none -- true >/dev/null 2>err.txt || rc=$?
+          rm -f .env.claude-box
+          [ "$rc" = 126 ] || { echo "FAIL: want exit 126, got $rc"; cat err.txt; exit 1; }
+          grep -q 'fault=engine-start-failed' err.txt \
+            || { echo "FAIL: missing fault=engine-start-failed line"; cat err.txt; exit 1; }
+          echo "fault line OK (exit $rc)"
+
+      # Headless runbook — redirected stdout carries only the payload's output:
+      # no CR, no cage/launcher log lines (those go to stderr), no stderr leak.
+      - name: Stream cleanliness
+        run: |
+          set -euo pipefail
+          cd /tmp/cbtest
+          CLAUDE_BOX_EXEC=1 "$GITHUB_WORKSPACE/claude-box" --engine none \
+            -- bash -c 'printf "hello\n"' >out.txt 2>/dev/null
+          [ "$(cat out.txt)" = "hello" ] || { echo "FAIL: stdout not exactly hello:"; cat -A out.txt; exit 1; }
+          [ "$(wc -l < out.txt)" -eq 1 ] || { echo "FAIL: unexpected line count"; exit 1; }
+          if grep -q $'\r' out.txt; then echo "FAIL: CR in stdout"; exit 1; fi
+          if grep -qE '\[cage\]|\[claude-box\]' out.txt; then echo "FAIL: log line leaked to stdout"; exit 1; fi
+          echo "stream cleanliness OK"
+
+      # Headless runbook — the state dump is opt-in via CLAUDE_BOX_DEBUG (-> CAGE_DEBUG);
+      # off by default, and it lists the state mount but never cats secrets.
+      - name: Debug dump opt-in
+        run: |
+          set -euo pipefail
+          cd /tmp/cbtest
+          CLAUDE_BOX_EXEC=1 "$GITHUB_WORKSPACE/claude-box" --engine none -- true >/dev/null 2>off.txt
+          CLAUDE_BOX_DEBUG=1 CLAUDE_BOX_EXEC=1 "$GITHUB_WORKSPACE/claude-box" --engine none -- true >/dev/null 2>on.txt
+          [ "$(grep -c 'state mount' off.txt)" -eq 0 ] || { echo "FAIL: dump present without debug"; exit 1; }
+          [ "$(grep -c 'state mount' on.txt)" -ge 1 ] || { echo "FAIL: dump absent with debug"; cat on.txt; exit 1; }
+          echo "debug dump opt-in OK"
+
+      # Headless runbook — an invalid --name is rejected before anything starts,
+      # and a box started headless is addressable via the --name-file handle.
+      - name: Box name handle + validation
+        run: |
+          set -euo pipefail
+          cd /tmp/cbtest
+          rc=0
+          CLAUDE_BOX_EXEC=1 "$GITHUB_WORKSPACE/claude-box" --name 'a b/c' --engine none -- true >/dev/null 2>err.txt || rc=$?
+          [ "$rc" = 1 ] || { echo "FAIL: invalid --name exited $rc, want 1"; cat err.txt; exit 1; }
+          grep -q 'invalid container name' err.txt || { echo "FAIL: missing invalid-name message"; cat err.txt; exit 1; }
+          echo "OK: invalid --name rejected"
+          h="$(mktemp)"; name="cbci-$$"
+          CLAUDE_BOX_EXEC=1 "$GITHUB_WORKSPACE/claude-box" --engine none --name "$name" --name-file "$h" \
+            -- sleep 120 >/dev/null 2>&1 &
+          launcher=$!
+          for _ in $(seq 1 150); do [ -s "$h" ] && break; sleep 0.2; done
+          [ "$(cat "$h")" = "$name" ] || { echo "FAIL: name-file not published"; kill "$launcher" 2>/dev/null || true; exit 1; }
+          for _ in $(seq 1 150); do docker inspect "$name" >/dev/null 2>&1 && break; sleep 0.2; done
+          docker exec "$name" true || { echo "FAIL: cannot exec into named box"; docker stop "$name" 2>/dev/null || true; exit 1; }
+          docker stop "$name" >/dev/null
+          wait "$launcher" 2>/dev/null || true
+          [ ! -e "$h" ] || { echo "FAIL: name-file not cleaned on exit"; exit 1; }
+          echo "name handle + validation OK"
