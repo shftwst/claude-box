@@ -111,6 +111,8 @@ NO_SSH=0
 UPGRADE=0
 OLLAMA_MODEL=""
 ENGINE_MODE=""
+BOX_NAME=""
+NAME_FILE=""
 declare -a _passthrough=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -129,11 +131,26 @@ while [[ $# -gt 0 ]]; do
       [[ -n "$ENGINE_MODE" ]] || { printf '[claude-box] --engine requires a mode (auto|sysbox|rootless|privileged-dind|none)\n' >&2; exit 1; }
       ;;
     --engine=*) ENGINE_MODE="${1#*=}" ;;
+    --name)
+      shift
+      BOX_NAME="${1:-}"
+      [[ -n "$BOX_NAME" ]] || { printf '[claude-box] --name requires a container name\n' >&2; exit 1; }
+      ;;
+    --name=*) BOX_NAME="${1#*=}" ;;
     *) _passthrough+=("$1") ;;
   esac
   shift
 done
 set -- "${_passthrough[@]+"${_passthrough[@]}"}"
+
+# A caller-supplied box name must satisfy docker's container-name charset; reject
+# early (before any docker call) with a precise message rather than letting
+# `docker run --name` fail obscurely mid-launch. Pre-flight usage error, so
+# exit 1 like the sibling flags, not the run-time fault()/125-127 path.
+if [[ -n "$BOX_NAME" && ! "$BOX_NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]]; then
+  printf '[claude-box] --name: invalid container name (allowed: [a-zA-Z0-9][a-zA-Z0-9_.-]*)\n' >&2
+  exit 1
+fi
 
 # There's no project-dir positional: claude-box always runs in the current
 # directory (the project root). Every remaining arg goes straight to claude.
@@ -200,7 +217,9 @@ ENTRYPOINT_SH="${CLAUDE_BOX_DIR}/entrypoint.sh"
 USERNS_PROBE_SH="${CLAUDE_BOX_DIR}/userns-probe.sh"
 BUILT_MARKER="${HOME}/.claude-box/.built"
 
-CONTAINER_NAME="claude-box-$(basename "$PROJECT_DIR")-$$"
+# A caller-supplied --name wins; otherwise the default stays unique per launcher
+# via the PID, so concurrent boxes never collide.
+CONTAINER_NAME="${BOX_NAME:-claude-box-$(basename "$PROJECT_DIR")-$$}"
 
 # Build the image if it doesn't exist or any build input has changed. Includes
 # entrypoint.sh because it's COPYed into the image, so changes there need a
