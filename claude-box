@@ -137,6 +137,12 @@ while [[ $# -gt 0 ]]; do
       [[ -n "$BOX_NAME" ]] || { printf '[claude-box] --name requires a container name\n' >&2; exit 1; }
       ;;
     --name=*) BOX_NAME="${1#*=}" ;;
+    --name-file)
+      shift
+      NAME_FILE="${1:-}"
+      [[ -n "$NAME_FILE" ]] || { printf '[claude-box] --name-file requires a path\n' >&2; exit 1; }
+      ;;
+    --name-file=*) NAME_FILE="${1#*=}" ;;
     *) _passthrough+=("$1") ;;
   esac
   shift
@@ -262,6 +268,9 @@ cleanup() {
     kill "$_SSH_RELAY_PID" 2>/dev/null || true
     wait "$_SSH_RELAY_PID" 2>/dev/null || true
   fi
+  # The published handle is only valid while the box lives (the container is
+  # --rm), so remove it on exit rather than leave a name pointing at nothing.
+  [[ -n "$NAME_FILE" ]] && rm -f "$NAME_FILE"
 }
 
 # Flush sessions, credentials, and satellite state from the container back to the
@@ -1099,6 +1108,18 @@ fi
 log "starting container..."
 _LAUNCHED=1
 _rc=0
+
+# Publish the box's name for a headless caller to address (docker stop/exec).
+# Written HERE — just before the container exists and inside the EXIT-trap
+# coverage (trap set above with sync_back/cleanup) — so the file's lifetime
+# matches the box's: cleanup() removes it on exit, and the container is --rm so a
+# post-exit handle would be dead anyway. A caller that only passes --name-file
+# polls for this file to appear, then reads the name.
+if [[ -n "$NAME_FILE" ]]; then
+  printf '%s\n' "$CONTAINER_NAME" > "$NAME_FILE" \
+    || warn "--name-file: could not write ${NAME_FILE}"
+fi
+
 docker run --rm "${TTY_FLAGS[@]}" \
   --name "$CONTAINER_NAME" \
   -e "HOST_UID=$(id -u)" \
