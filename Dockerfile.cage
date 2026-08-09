@@ -1,0 +1,81 @@
+FROM node:22-bookworm-slim
+
+# cage-base — the payload-free box: host-isolation tooling and a full nested
+# container engine (ADR-0041 decision 3), with NO agent harness baked in. A
+# payload image (claude-box, codex-box) does `FROM cage-base` and adds its own
+# harness. Nothing Claude-specific lives here: no claude-code, no ugrep
+# grep-shadow, no bun — those moved to the Claude payload layer.
+#
+# The cage gets its OWN dockerd — rootless by default, rootful under sysbox /
+# privileged dind — never a mounted host socket. docker-ce brings dockerd;
+# docker-ce-rootless-extras brings dockerd-rootless.sh + rootlesskit;
+# uidmap/slirp4netns/fuse-overlayfs/iproute2/iptables are the rootless engine's
+# userns, networking, and storage tooling.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git curl ca-certificates gnupg unzip jq openssh-client socat \
+    python3 python3-pip python3-venv \
+    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+       | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+       | tee /etc/apt/sources.list.d/github-cli.list \
+    && curl -fsSL https://download.docker.com/linux/debian/gpg \
+       | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/debian bookworm stable" \
+       | tee /etc/apt/sources.list.d/docker.list \
+    && apt-get update && apt-get install -y --no-install-recommends gh \
+       docker-ce docker-ce-cli containerd.io \
+       docker-buildx-plugin docker-compose-plugin docker-ce-rootless-extras \
+       uidmap slirp4netns fuse-overlayfs iproute2 iptables kmod procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# Chromium runtime libs so Playwright (installed per-project in venvs) can launch
+# its bundled browser without needing root at runtime. Browser binary itself is
+# not baked in — `playwright install chromium` fetches it on demand. Generic
+# capability, not Claude's, so it belongs in the cage.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libnss3 libnspr4 libdbus-1-3 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
+    libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2 \
+    libpango-1.0-0 libcairo2 libxkbcommon0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# AWS CLI v2 — official bundled installer (arch-aware). Netlify CLI ships via
+# npm below; flyctl via its official install script. Generic deploy CLIs.
+RUN case "$(dpkg --print-architecture)" in \
+        amd64) awscli_arch=x86_64 ;; \
+        arm64) awscli_arch=aarch64 ;; \
+        *) echo "unsupported arch for aws cli" >&2; exit 1 ;; \
+    esac \
+    && curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-${awscli_arch}.zip" -o /tmp/awscliv2.zip \
+    && unzip -q /tmp/awscliv2.zip -d /tmp \
+    && /tmp/aws/install \
+    && rm -rf /tmp/awscliv2.zip /tmp/aws
+
+# flyctl — Fly.io CLI, via the official install script. FLYCTL_INSTALL sets the
+# install prefix so the binary lands on the system PATH.
+RUN curl -fsSL https://fly.io/install.sh | FLYCTL_INSTALL=/usr/local sh
+
+# Netlify CLI + Wrangler (Cloudflare) — npm globals
+RUN npm install -g netlify-cli wrangler \
+    && npm cache clean --force
+
+# uv — fast Python package + venv manager. Used by skills that bootstrap Python
+# deps without polluting system site-packages or hitting PEP 668. Pulled from
+# the official Astral image so we don't curl-pipe-sh.
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+
+# Yarn Berry (for Node.js projects using Yarn 4)
+RUN corepack enable && corepack prepare yarn@4.13.0 --activate
+
+# gosu — minimal su/sudo for Docker; does a direct exec as the target user
+# so the TTY and signal handling are properly inherited (unlike su -c "...").
+RUN curl -fsSL "https://github.com/tianon/gosu/releases/download/1.17/gosu-$(dpkg --print-architecture)" \
+       -o /usr/local/bin/gosu \
+    && chmod +x /usr/local/bin/gosu \
+    && gosu nobody true
+
+COPY entrypoint-cage.sh /usr/local/bin/cage-entrypoint.sh
+COPY userns-probe.sh /usr/local/bin/claude-box-userns-probe
+RUN chmod +x /usr/local/bin/cage-entrypoint.sh /usr/local/bin/claude-box-userns-probe
+
+ENTRYPOINT ["/usr/local/bin/cage-entrypoint.sh"]

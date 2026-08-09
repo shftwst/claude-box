@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+# codex-box — run the OpenAI Codex CLI in the cage (see libcage.sh).
+#
+# Mounts the project dir at its exact host path so tooling resolves. Persists
+# Codex state (~/.codex: auth.json, config.toml, sessions) in ~/.codex-box/state
+# across runs — delete that dir to reset. Authenticates from a persisted
+# `codex login`: log in once on the host, and the box reuses it; an in-box login
+# or token refresh is synced back to the host on exit.
+#
+# Always runs in the current directory (the project root). cd into your project
+# first, then:
+#   codex-box                     # interactive session
+#   codex-box "fix the flaky test"# start with a prompt
+#   codex-box resume --last       # any codex subcommand/flags pass through
+#
+# Every argument is passed straight through to codex. Use `--` to force
+# everything after it to codex (e.g. `codex-box -- --engine foo`).
+#
+# codex-box-specific flags (consumed before codex sees them; position-free):
+#   --no-ssh / --upgrade / --engine <mode> / --name <name> / --name-file <path>
+# — identical to claude-box; see libcage.sh and the README.
+#
+# Installation:
+#   ln -sf ~/claude-box/codex-box /usr/local/bin/codex-box
+
+set -euo pipefail
+
+# Resolve symlinks so an install via `ln -sf` still finds the repo dir.
+_self="${BASH_SOURCE[0]}"
+while [[ -L "$_self" ]]; do
+  _link=$(readlink "$_self")
+  [[ "$_link" = /* ]] && _self="$_link" || _self="$(dirname "$_self")/$_link"
+done
+BOX_SRC_DIR="$(cd "$(dirname "$_self")" && pwd)"
+
+# --- cage config ---
+BOX_LABEL="codex-box"
+BOX_IMAGE="codex-box"
+BOX_DOCKERFILE="${BOX_SRC_DIR}/Dockerfile.codex"
+BOX_STATE_DIR="${HOME}/.codex-box/state"
+BOX_STATE_MOUNT="${HOME}/.codex"
+BOX_ENV_PREFIX="CODEX_BOX"
+BOX_FORWARD_VARS=(OPENAI_API_KEY)
+# The cage is the isolation boundary, so Codex runs with its own sandbox and
+# approval friction off (its analogue of claude's --dangerously-skip-permissions).
+# mcp_oauth_credentials_store=file forces MCP OAuth logins (e.g. the Linear
+# remote MCP) into ${CODEX_HOME}/.credentials.json instead of the OS keyring, so
+# they live under ~/.codex = the persisted, host-seeded state volume. A macOS
+# Keychain token can't cross into a Linux box; a file one seeds straight in.
+BOX_PAYLOAD_CMD=(codex --dangerously-bypass-approvals-and-sandbox -c 'mcp_oauth_credentials_store="file"')
+
+# shellcheck source=libcage.sh
+source "${BOX_SRC_DIR}/libcage.sh"
+
+# --- payload hooks ---
+
+# Extract every "Codex MCP Credentials" Keychain entry (macOS) and rewrite it as
+# ${STATE_DIR}/.credentials.json in the file format the box reads. The Keychain
+# stores a StoredOAuthTokens JSON keyed by the store key (== the Keychain account
+# name); the file wants a BTreeMap<store_key, FallbackTokenEntry> with the token
+# flattened out. So we key by the account verbatim and transform the shape.
+# All-or-nothing best effort: any failure leaves the seeded file untouched and
+# the launch proceeds. macOS-only (guards on `security`); no-op elsewhere.
+_codex_seed_mcp_from_keychain() {
+  command -v security >/dev/null 2>&1 || return 0
+  command -v node     >/dev/null 2>&1 || return 0
+
+  # Read the Keychain ONCE. Every read triggers a macOS access prompt, so once
+  # the box has a seeded .credentials.json we leave it alone: Codex refreshes the
+  # file's tokens itself in file mode via the stored refresh_token, so it stays
+  # valid without touching the Keychain again. Force a fresh read (e.g. after a
+  # host re-login) with CODEX_BOX_RESEED_MCP=1, or by deleting the state file:
+  #   rm ~/.codex-box/state/.credentials.json
+  local reseed_var="${BOX_ENV_PREFIX}_RESEED_MCP"
+  if [[ -s "${STATE_DIR}/.credentials.json" && -z "${!reseed_var:-}" ]]; then
+    return 0
+  fi
+
+  local svc="Codex MCP Credentials" accts a pw stream=""
+
+  # Account names come from dump-keychain (attributes only; no access prompt).
+  accts=$(security dump-keychain 2>/dev/null | awk -v S="$svc" '
+    /^keychain: /   { if (svce==S && acct!="") print acct; acct=""; svce="" }
+    /"acct"<blob>=/ { l=$0; sub(/.*"acct"<blob>="/,"",l); sub(/"$/,"",l); acct=l }
+    /"svce"<blob>=/ { l=$0; sub(/.*"svce"<blob>="/,"",l); sub(/"$/,"",l); svce=l }
+    END             { if (svce==S && acct!="") print acct }
+  ')
+  # Fallback to the single primary item if the dump yielded nothing.
+  if [ -z "$accts" ]; then
+    accts=$(security find-generic-password -s "$svc" -g 2>&1 \
+      | sed -n 's/^[[:space:]]*"acct"<blob>="\(.*\)"$/\1/p' | head -1)
+  fi
+  [ -n "$accts" ] || return 0
+
+  # Read each item's password (the StoredOAuthTokens JSON). This is the step that
+  # may pop a one-time Keychain access prompt per item (click Always Allow).
+  while IFS= read -r a; do
+    [ -n "$a" ] || continue
+    pw=$(security find-generic-password -s "$svc" -a "$a" -w 2>/dev/null) || continue
+    [ -n "$pw" ] || continue
+    stream+="${a}"$'\n'"${pw}"$'\n'
+  done <<< "$accts"
+  [ -n "$stream" ] || return 0
+
+  # PID-based temp name (not mktemp): BSD mktemp on macOS rejects a suffix after
+  # the X's, and this matches how the monolith stages its sync helper.
+  local xform="${TMPDIR:-/tmp}/codex-kc.$$.js"
+  cat > "$xform" <<'JSEOF'
+// stdin: alternating lines of  account\nStoredOAuthTokens-JSON\n ...
+// stdout: { "<account>": FallbackTokenEntry } for the file store.
+const fs = require('fs');
+let buf = ''; try { buf = fs.readFileSync(0, 'utf8'); } catch { process.exit(1); }
+const lines = buf.split('\n');
+const out = {};
+for (let i = 0; i + 1 < lines.length; i += 2) {
+  const acct = lines[i], raw = lines[i + 1];
+  if (!acct || !raw) continue;
+  let s; try { s = JSON.parse(raw); } catch { continue; }
+  const tr = s.token_response || {};              // WrappedOAuthTokenResponse is transparent
+  const access = tr.access_token;
+  if (!access) continue;
+  const refresh = (tr.refresh_token != null) ? tr.refresh_token : null;
+  const scopes = tr.scope ? String(tr.scope).trim().split(/\s+/).filter(Boolean) : [];
+  let expires_at = null;
+  if (s.expires_at != null) expires_at = s.expires_at;
+  else if (tr.expires_in != null) expires_at = Date.now() + Number(tr.expires_in) * 1000;
+  const sep = (acct.length >= 17) ? acct[acct.length - 17] : '|';   // ':' => executor-owned
+  const entry = {
+    server_name: s.server_name,
+    server_url: s.url,
+    client_id: s.client_id,
+    access_token: access,
+    expires_at: expires_at,
+    refresh_token: refresh,
+    scopes: scopes,
+  };
+  if (sep === ':') entry.executor_owned = true;
+  out[acct] = entry;
+}
+if (Object.keys(out).length === 0) process.exit(1);
+process.stdout.write(JSON.stringify(out, null, 2));
+JSEOF
+
+  local tmp="${STATE_DIR}/.credentials.json.tmp"
+  if printf '%s' "$stream" | node "$xform" > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+    mv -f "$tmp" "${STATE_DIR}/.credentials.json"
+    log "seeded MCP logins from Keychain into .credentials.json"
+  else
+    rm -f "$tmp"
+  fi
+  rm -f "$xform"
+}
+
+# Seed the host's ~/.codex (login, config, sessions) into the state dir so a
+# host `codex login` is reused in the box; newer-wins (no --delete) so an
+# in-box-newer login isn't clobbered by a stale host copy. Also build the merged
+# AGENTS.md into the cage relay — Codex reads AGENTS.md natively.
+box_stage() {
+  if [[ -d "${HOME}/.codex" ]]; then
+    log "seeding ~/.codex login/config..."
+    rsync -au "${HOME}/.codex/" "${STATE_DIR}/" 2>/dev/null \
+      || cp -ru "${HOME}/.codex/." "${STATE_DIR}/" 2>/dev/null || true
+  fi
+
+  # Lift MCP OAuth logins (Linear, etc.) out of the macOS Keychain into the
+  # file the box reads. Standard Codex stores them under Keychain service
+  # "Codex MCP Credentials" (Auto mode), which a Linux box can't read; the box
+  # is forced to file mode, so seed ${CODEX_HOME}/.credentials.json from the
+  # Keychain here — no re-login. Mirrors claude-box's Keychain credential lift.
+  _codex_seed_mcp_from_keychain
+
+  # Merged AGENTS.md: global ~/.agents/AGENTS.md -> parent dirs -> project.
+  # Skip if the cage couldn't provide a writable relay dir (see cage_stage_gitconfig).
+  [[ -n "$RELAY_DIR" ]] || return 0
+  : > "${RELAY_DIR}/AGENTS.md"
+  [[ -f "${HOME}/.agents/AGENTS.md" ]] && cat "${HOME}/.agents/AGENTS.md" >> "${RELAY_DIR}/AGENTS.md"
+  local agents_files=()
+  local current="$PROJECT_DIR"
+  while [[ "$current" != "/" ]]; do
+    [[ -f "$current/AGENTS.md" ]] && agents_files+=("$current/AGENTS.md")
+    current="$(dirname "$current")"
+  done
+  local i f
+  for (( i=${#agents_files[@]}-1; i>=0; i-- )); do
+    f="${agents_files[$i]}"
+    printf '\n<!-- %s -->\n' "$f" >> "${RELAY_DIR}/AGENTS.md"
+    cat "$f" >> "${RELAY_DIR}/AGENTS.md"
+  done
+}
+
+# Sync the refreshed account login back to the host so host codex and the next
+# box run pick it up. Only auth.json (the ChatGPT OAuth / API-key state), which
+# is a real file on the host. MCP logins are intentionally NOT pushed back: the
+# host stores those in the Keychain (Auto mode) and ignores a file copy, and the
+# box re-seeds them from the Keychain every launch, so a pushed-back
+# .credentials.json would only be an inert, stale artifact on the host.
+box_sync_back() {
+  cage_cp_out "auth.json"
+  if [[ -s "${STATE_DIR}/auth.json" ]]; then
+    mkdir -p "${HOME}/.codex"
+    cp -pf "${STATE_DIR}/auth.json" "${HOME}/.codex/auth.json" 2>/dev/null || true
+    log "synced ~/.codex/auth.json back to host"
+  fi
+}
+
+cage_run "$@"
