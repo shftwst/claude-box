@@ -372,7 +372,16 @@ cage_build_images() {
   local marker="${HOME}/.claude-box/.built-${BOX_LABEL}"
   need=0
   if ! docker image inspect "$BOX_IMAGE" &>/dev/null; then need=1
-  elif [[ "$BOX_DOCKERFILE" -nt "$marker" || "$cage_marker" -nt "$marker" ]]; then need=1; fi
+  elif [[ "$BOX_DOCKERFILE" -nt "$marker" || "$cage_marker" -nt "$marker" ]]; then need=1
+  else
+    # Extra build inputs the payload Dockerfile COPYs (payload-init, theme, ...):
+    # a change to any must force a rebuild too, since the Dockerfile itself is
+    # unchanged. BOX_BUILD_INPUTS is a wrapper-set array of absolute paths.
+    local _in
+    for _in in "${BOX_BUILD_INPUTS[@]+"${BOX_BUILD_INPUTS[@]}"}"; do
+      [[ "$_in" -nt "$marker" ]] && { need=1; break; }
+    done
+  fi
   if [[ $need -eq 1 ]]; then
     log "building ${BOX_LABEL} image..."
     if ! docker build -f "$BOX_DOCKERFILE" -t "$BOX_IMAGE" "$BOX_SRC_DIR"; then
@@ -539,7 +548,6 @@ cage_run() {
     -e "HOST_GID=$(id -g)" \
     -e "HOME=${HOME}" \
     -e "CAGE_STATE_MOUNT=${BOX_STATE_MOUNT}" \
-    -e "SKIP_NPM_PACKAGES_INSTALL=1" \
     -e "GIT_CONFIG_COUNT=3" \
     -e "GIT_CONFIG_KEY_0=safe.directory" \
     -e "GIT_CONFIG_VALUE_0=*" \

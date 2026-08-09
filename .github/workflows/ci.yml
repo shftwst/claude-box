@@ -13,5 +13,8 @@ jobs:
       - name: Syntax-check shell scripts
         run: |
           bash -n claude-box
-          bash -n entrypoint.sh
+          bash -n codex-box
+          bash -n libcage.sh
+          bash -n entrypoint-cage.sh
           bash -n userns-probe.sh
+          bash -n payload-init-claude.sh
