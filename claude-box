@@ -60,6 +60,16 @@
 # stdout carries only the harness's output — no CRLF, no [entrypoint] lines,
 # nothing from stderr — because a PTY is allocated only when both stdout and
 # stderr are terminals.
+#
+# Addressing a headless box:
+#   --name <name>       set the container name (default claude-box-<project>-<pid>).
+#                       Must match docker's charset [a-zA-Z0-9][a-zA-Z0-9_.-]*.
+#   --name-file <path>  write the resolved name to <path> just before launch and
+#                       remove it on exit. A supervisor polls <path>, reads the
+#                       name, then `docker stop`/`docker exec` the box.
+# Launcher warnings (rootless-userns unsupported, apparmor/SSH-relay failures)
+# print as `[claude-box] WARNING: …` on stderr unconditionally, so a headless
+# caller sees them; informational progress lines stay quiet unless stderr is a tty.
 
 set -euo pipefail
 
@@ -74,6 +84,14 @@ log() { [[ ! -t 2 ]] || printf '[claude-box] %s\n' "$*" >&2; }
 # or not stderr is a terminal. fault=<reason> is the stable field; detail="…" is
 # human context. Never returns nonzero, so a bare `fault` can't trip set -e.
 fault() { printf 'claude-box: fault=%s detail="%s"\n' "$1" "${2:-}" >&2; return 0; }
+
+# Machine-facing WARNING line. Like fault(), UNCONDITIONAL on the tty: a headless
+# caller (CI, a supervisor) relies on these to explain why a rootless engine or
+# SSH relay didn't come up, which log() would silently drop when stderr is not a
+# terminal. Goes to stderr, so a redirected stdout still carries only the
+# harness's output. Interactive runs print the identical line (warn() ignores the
+# tty), so headless and interactive stderr match verbatim.
+warn() { printf '[claude-box] WARNING: %s\n' "$*" >&2; }
 
 # Background-check the install dir against its upstream. Detached so the parent
 # never waits and silent on every failure mode (not a repo, no upstream,
@@ -103,6 +121,8 @@ NO_SSH=0
 UPGRADE=0
 OLLAMA_MODEL=""
 ENGINE_MODE=""
+BOX_NAME=""
+NAME_FILE=""
 declare -a _passthrough=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -121,11 +141,32 @@ while [[ $# -gt 0 ]]; do
       [[ -n "$ENGINE_MODE" ]] || { printf '[claude-box] --engine requires a mode (auto|sysbox|rootless|privileged-dind|none)\n' >&2; exit 1; }
       ;;
     --engine=*) ENGINE_MODE="${1#*=}" ;;
+    --name)
+      shift
+      BOX_NAME="${1:-}"
+      [[ -n "$BOX_NAME" ]] || { printf '[claude-box] --name requires a container name\n' >&2; exit 1; }
+      ;;
+    --name=*) BOX_NAME="${1#*=}" ;;
+    --name-file)
+      shift
+      NAME_FILE="${1:-}"
+      [[ -n "$NAME_FILE" ]] || { printf '[claude-box] --name-file requires a path\n' >&2; exit 1; }
+      ;;
+    --name-file=*) NAME_FILE="${1#*=}" ;;
     *) _passthrough+=("$1") ;;
   esac
   shift
 done
 set -- "${_passthrough[@]+"${_passthrough[@]}"}"
+
+# A caller-supplied box name must satisfy docker's container-name charset; reject
+# early (before any docker call) with a precise message rather than letting
+# `docker run --name` fail obscurely mid-launch. Pre-flight usage error, so
+# exit 1 like the sibling flags, not the run-time fault()/125-127 path.
+if [[ -n "$BOX_NAME" && ! "$BOX_NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]]; then
+  printf '[claude-box] --name: invalid container name (allowed: [a-zA-Z0-9][a-zA-Z0-9_.-]*)\n' >&2
+  exit 1
+fi
 
 # There's no project-dir positional: claude-box always runs in the current
 # directory (the project root). Every remaining arg goes straight to claude.
@@ -192,7 +233,9 @@ ENTRYPOINT_SH="${CLAUDE_BOX_DIR}/entrypoint.sh"
 USERNS_PROBE_SH="${CLAUDE_BOX_DIR}/userns-probe.sh"
 BUILT_MARKER="${HOME}/.claude-box/.built"
 
-CONTAINER_NAME="claude-box-$(basename "$PROJECT_DIR")-$$"
+# A caller-supplied --name wins; otherwise the default stays unique per launcher
+# via the PID, so concurrent boxes never collide.
+CONTAINER_NAME="${BOX_NAME:-claude-box-$(basename "$PROJECT_DIR")-$$}"
 
 # Build the image if it doesn't exist or any build input has changed. Includes
 # entrypoint.sh because it's COPYed into the image, so changes there need a
@@ -235,6 +278,9 @@ cleanup() {
     kill "$_SSH_RELAY_PID" 2>/dev/null || true
     wait "$_SSH_RELAY_PID" 2>/dev/null || true
   fi
+  # The published handle is only valid while the box lives (the container is
+  # --rm), so remove it on exit rather than leave a name pointing at nothing.
+  [[ -n "$NAME_FILE" ]] && rm -f "$NAME_FILE"
 }
 
 # Flush sessions, credentials, and satellite state from the container back to the
@@ -520,7 +566,7 @@ case "$ENGINE" in
         [[ "$_host_docker_caps" == *apparmor* ]] && engine_args+=(--security-opt apparmor=unconfined)
         ;;
       profile|profile-cap)
-        _load_userns_profile || log "WARNING: apparmor profile load failed — engine may not start"
+        _load_userns_profile || warn "apparmor profile load failed: engine may not start"
         engine_args+=(--security-opt apparmor=claude-box-engine)
         [[ "$_userns_strategy" == profile-cap ]] && engine_args+=(--cap-add SYS_ADMIN)
         ;;
@@ -528,10 +574,10 @@ case "$ENGINE" in
         engine_args+=(--cap-add SYS_ADMIN)
         ;;
       unsupported)
-        log "WARNING: this docker host cannot give an unprivileged user a capable user"
-        log "WARNING: namespace, so the rootless nested engine will likely fail to start."
-        log "WARNING: consider sysbox, or '--engine privileged-dind' (ADR-0041's named"
-        log "WARNING: weaker posture), or '--engine none'."
+        warn "this docker host cannot give an unprivileged user a capable user"
+        warn "namespace, so the rootless nested engine will likely fail to start."
+        warn "consider sysbox, or '--engine privileged-dind' (ADR-0041's named"
+        warn "weaker posture), or '--engine none'."
         [[ "$_host_docker_caps" == *apparmor* ]] && engine_args+=(--security-opt apparmor=unconfined)
         ;;
     esac
@@ -540,8 +586,8 @@ case "$ENGINE" in
     log "engine: rootless nested dockerd (userns strategy: ${_userns_strategy})"
     ;;
   privileged-dind)
-    log "WARNING: --engine privileged-dind is ADR-0041's named weaker posture —"
-    log "WARNING: a privileged cage weakens host isolation. Prefer sysbox or rootless."
+    warn "--engine privileged-dind is ADR-0041's named weaker posture:"
+    warn "a privileged cage weakens host isolation. Prefer sysbox or rootless."
     engine_args+=(--privileged -e "CLAUDE_BOX_ENGINE=rootful" -v /var/lib/docker --init)
     ;;
   none)
@@ -717,7 +763,7 @@ while True:
       done
       rm -f "$_relay_port_file"
       if [[ -z "$_RELAY_PORT" ]]; then
-        log "warning: SSH agent relay failed to start — signing will not work"
+        warn "SSH agent relay failed to start: signing will not work"
         kill "$_SSH_RELAY_PID" 2>/dev/null || true
         _SSH_RELAY_PID=""
       else
@@ -1072,6 +1118,18 @@ fi
 log "starting container..."
 _LAUNCHED=1
 _rc=0
+
+# Publish the box's name for a headless caller to address (docker stop/exec).
+# Written HERE — just before the container exists and inside the EXIT-trap
+# coverage (trap set above with sync_back/cleanup) — so the file's lifetime
+# matches the box's: cleanup() removes it on exit, and the container is --rm so a
+# post-exit handle would be dead anyway. A caller that only passes --name-file
+# polls for this file to appear, then reads the name.
+if [[ -n "$NAME_FILE" ]]; then
+  printf '%s\n' "$CONTAINER_NAME" > "$NAME_FILE" \
+    || warn "--name-file: could not write ${NAME_FILE}"
+fi
+
 docker run --rm "${TTY_FLAGS[@]}" \
   --name "$CONTAINER_NAME" \
   -e "HOST_UID=$(id -u)" \

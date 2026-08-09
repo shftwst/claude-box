@@ -57,6 +57,8 @@ These are consumed by the wrapper before `claude` sees them (position-free, so t
 - `--no-ssh` — skip mounting `~/.ssh` and forwarding the SSH agent. Disables git-over-SSH and commit signing inside the container; useful for sessions that don't touch git remotes.
 - `--ollama <model>` — point Claude Code at an Ollama server instead of the Anthropic API. See [Ollama](#ollama).
 - `--engine <mode>` — nested container engine posture: `auto` (default), `sysbox`, `rootless`, `privileged-dind`, `none`. See [Nested container engine](#nested-container-engine).
+- `--name <name>`: name the box's container (default `claude-box-<project>-<pid>`), so a caller can address it with `docker stop` / `docker exec`. Must match docker's charset `[a-zA-Z0-9][a-zA-Z0-9_.-]*`.
+- `--name-file <path>`: write the resolved container name to `<path>` just before launch (removed on exit), so a headless supervisor can discover the box and stop it.
 
 ## Ollama
 
