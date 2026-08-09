@@ -60,6 +60,16 @@
 # stdout carries only the harness's output — no CRLF, no [entrypoint] lines,
 # nothing from stderr — because a PTY is allocated only when both stdout and
 # stderr are terminals.
+#
+# Addressing a headless box:
+#   --name <name>       set the container name (default claude-box-<project>-<pid>).
+#                       Must match docker's charset [a-zA-Z0-9][a-zA-Z0-9_.-]*.
+#   --name-file <path>  write the resolved name to <path> just before launch and
+#                       remove it on exit. A supervisor polls <path>, reads the
+#                       name, then `docker stop`/`docker exec` the box.
+# Launcher warnings (rootless-userns unsupported, apparmor/SSH-relay failures)
+# print as `[claude-box] WARNING: …` on stderr unconditionally, so a headless
+# caller sees them; informational progress lines stay quiet unless stderr is a tty.
 
 set -euo pipefail
 

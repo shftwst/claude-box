@@ -239,6 +239,58 @@ before touching the state volume, so the copy-out cannot race a live container.
 
 ---
 
+## Part 5 — Warnings survive a non-terminal stderr
+
+Launcher warnings must reach captured stderr headless, identically to an
+interactive run. Prime the userns-strategy cache to `unsupported` so the
+rootless engine prints its warning block, then capture with stderr redirected
+(not a tty):
+
+```sh
+# The cache key is the docker-host slug; prime whichever files exist (there is
+# one per host you've probed):
+for f in ~/.claude-box/.userns-strategy-*; do echo unsupported > "$f"; done
+
+claude-box --engine rootless -- --version >out.txt 2>err.txt || true
+grep -q '^\[claude-box\] WARNING: this docker host cannot' err.txt && echo "WARN_HEADLESS_OK"
+
+# Restore real probing afterwards:
+rm -f ~/.claude-box/.userns-strategy-*
+```
+
+PASS: `WARN_HEADLESS_OK`. The same `[claude-box] WARNING: …` line appears on an
+interactive run's terminal, because `warn()` ignores the tty.
+
+---
+
+## Part 6 — Address a box started headless
+
+A caller starts a box with no tty, discovers its container name via
+`--name-file`, and stops it. Uses the `CLAUDE_BOX_EXEC` hook to hold the box
+open with a plain `sleep` (no auth needed):
+
+```sh
+h="$(mktemp)"
+CLAUDE_BOX_EXEC=1 claude-box --name-file "$h" -- sleep 300 >/dev/null 2>&1 &
+launcher=$!
+
+# The name is published just before the container starts; poll for it.
+for _ in $(seq 1 100); do [ -s "$h" ] && break; sleep 0.1; done
+name="$(cat "$h")"; echo "handle=$name"
+
+docker exec "$name" true && echo "EXEC_OK"
+docker stop "$name" >/dev/null && echo "STOP_OK"
+wait "$launcher" 2>/dev/null
+
+[ -e "$h" ] || echo "NAME_FILE_CLEANED"
+```
+
+PASS: `handle=…`, `EXEC_OK`, `STOP_OK`, `NAME_FILE_CLEANED`. A caller-supplied
+`--name my-box` is addressable the same way; an invalid `--name 'a b/c'` exits 1
+with `[claude-box] --name: invalid container name` and starts nothing.
+
+---
+
 ## Results checklist
 
 | # | Criterion | Expected |
@@ -254,3 +306,6 @@ before touching the state volume, so the copy-out cannot race a live container.
 | 3b | `-i` gating | pipe round-trips; no-stdin run doesn't hang (≠124) |
 | 3c | debug dump | absent by default; present with `CLAUDE_BOX_DEBUG=1` |
 | 4 | SIGINT headless | launcher exits; no live/lingering container |
+| 5 | warnings survive headless | `[claude-box] WARNING: …` in captured stderr |
+| 6 | address a headless box | `--name-file` published, `docker stop` works, file cleaned |
+| 6 | `--name` validation | bad name exits 1, starts nothing |
