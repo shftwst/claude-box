@@ -1,987 +1,254 @@
 #!/usr/bin/env bash
-# claude-box — run Claude Code in Docker with --dangerously-skip-permissions
+# claude-box — run Claude Code in the cage (see libcage.sh) with
+# --dangerously-skip-permissions.
 #
 # Mounts the project dir at its exact host path so skill symlinks resolve.
 # Persists Claude Code state (settings, conversations) in ~/.claude-box/state/
-# across runs — delete that dir to reset.
-# Syncs ~/.claude skills, plugins, hooks, and .mcp.json into the
-# container so your local setup is always reflected.
-# Sessions for the current project are written to ~/.claude/projects/<slug>/
-# on the host so they're resumable from host Claude as well as future
-# claude-box runs in the same project. Session-keyed satellite state (todos,
-# shell env, pastes, plans, file-history) is also shared so resume preserves
-# more than just the transcript.
+# across runs — delete that dir to reset. Syncs ~/.claude skills, plugins, hooks,
+# and .mcp.json into the container. Sessions for the current project are shared
+# with the host's ~/.claude/projects/<slug>/ so they're resumable from host
+# Claude too, along with session-keyed satellite state (todos, shell env, pastes,
+# plans, file-history).
 #
 # Always runs in the current directory (the project root). cd into your project
 # first, then:
 #   claude-box                  # interactive session
 #   claude-box -c               # continue most recent session here
-#   claude-box --resume         # pick a session to resume (interactive picker)
+#   claude-box --resume         # interactive session picker
 #   claude-box -r <id>          # resume a specific session by ID
 #   claude-box -p "..."         # non-interactive prompt (pipe-friendly)
 #
-# Every argument is passed straight through to claude, so `claude-box --model
-# sonnet`, `claude-box --mcp-config ...`, etc. all work. Use `--` to force
-# everything after it to claude, so a claude flag that shares a name with a
-# claude-box flag can still be passed, e.g. `claude-box -- --engine foo` sends
-# `--engine foo` to claude, not claude-box.
+# Every argument is passed straight through to claude. Use `--` to force
+# everything after it to claude.
 #
 # claude-box-specific flags (consumed before claude sees them; position-free):
-#   --no-ssh                    # skip ~/.ssh mount and SSH_AUTH_SOCK forwarding
-#                                 (signing/git-over-ssh disabled inside container)
-#   --upgrade                   # git pull the claude-box install dir and exit
-#                                 (next run rebuilds the image if needed)
-#   --ollama <model>            # point Claude Code at an Ollama server's
+#   --ollama <model>            # route Claude Code at an Ollama server's
 #                                 Anthropic-compatible API (base URL from
-#                                 OLLAMA_HOST, e.g. a Tailscale peer)
-#   --engine <mode>             # nested container engine posture (ADR-0041):
-#                                 auto (default: sysbox if the host runtime
-#                                 has it, else rootless), sysbox, rootless,
-#                                 privileged-dind (named weaker posture),
-#                                 none. The host docker socket is NEVER
-#                                 mounted into the box.
+#                                 OLLAMA_HOST)
+# plus the cage-generic flags (see libcage.sh / README):
+#   --no-ssh / --upgrade / --engine <mode> / --name <name> / --name-file <path>
 #
 # Installation:
 #   git clone https://github.com/shftwst/claude-box ~/claude-box
 #   ln -sf ~/claude-box/claude-box /usr/local/bin/claude-box
-#   # or add ~/claude-box to PATH
-#
-# Exit status (so `claude-box -p …` composes in scripts, CI, and one-shots):
-#   0        the harness (claude) succeeded
-#   1–124    the harness's own exit code, verbatim
-#   125      launcher fault — image missing
-#   126      launcher fault — engine start failed
-#   127      launcher fault — harness not executable
-#   128+     signal deaths, verbatim
-# Every launcher fault also prints `claude-box: fault=<reason> detail="…"` to
-# stderr (unconditionally, even headless), so a caller testing only zero-vs-
-# nonzero keeps working while one needing precision can parse fault=. 125–127
-# follow docker run's own daemon/invoke/not-found vocabulary. A redirected
-# stdout carries only the harness's output — no CRLF, no [entrypoint] lines,
-# nothing from stderr — because a PTY is allocated only when both stdout and
-# stderr are terminals.
-#
-# Addressing a headless box:
-#   --name <name>       set the container name (default claude-box-<project>-<pid>).
-#                       Must match docker's charset [a-zA-Z0-9][a-zA-Z0-9_.-]*.
-#   --name-file <path>  write the resolved name to <path> just before launch and
-#                       remove it on exit. A supervisor polls <path>, reads the
-#                       name, then `docker stop`/`docker exec` the box.
-# Launcher warnings (rootless-userns unsupported, apparmor/SSH-relay failures)
-# print as `[claude-box] WARNING: …` on stderr unconditionally, so a headless
-# caller sees them; informational progress lines stay quiet unless stderr is a tty.
 
 set -euo pipefail
 
-# Progress logs to stderr, gated on a tty so piped/non-interactive runs stay
-# clean. Must never return nonzero: a bare top-level `log` under set -e would
-# otherwise kill the script whenever stderr isn't a tty.
-log() { [[ ! -t 2 ]] || printf '[claude-box] %s\n' "$*" >&2; }
-
-# Machine-readable launcher-fault line. UNLIKE log(), this is unconditional on
-# the tty: a headless caller relies on it to disambiguate the exit code (see the
-# exit-status contract in the header), so it must reach captured stderr whether
-# or not stderr is a terminal. fault=<reason> is the stable field; detail="…" is
-# human context. Never returns nonzero, so a bare `fault` can't trip set -e.
-fault() { printf 'claude-box: fault=%s detail="%s"\n' "$1" "${2:-}" >&2; return 0; }
-
-# Machine-facing WARNING line. Like fault(), UNCONDITIONAL on the tty: a headless
-# caller (CI, a supervisor) relies on these to explain why a rootless engine or
-# SSH relay didn't come up, which log() would silently drop when stderr is not a
-# terminal. Goes to stderr, so a redirected stdout still carries only the
-# harness's output. Interactive runs print the identical line (warn() ignores the
-# tty), so headless and interactive stderr match verbatim.
-warn() { printf '[claude-box] WARNING: %s\n' "$*" >&2; }
-
-# Background-check the install dir against its upstream. Detached so the parent
-# never waits and silent on every failure mode (not a repo, no upstream,
-# offline, fetch fails) — those skips don't touch $UPDATE_CHECK_FILE so we
-# retry next launch instead of going dark for 24h on a transient blip.
-check_for_update_in_background() {
-  (
-    cd "$CLAUDE_BOX_DIR" || exit 0
-    git rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1 || exit 0
-    git fetch --quiet 2>/dev/null || exit 0
-    if [[ $(git rev-list --count HEAD..@{u} 2>/dev/null || echo 0) -gt 0 ]]; then
-      touch "$UPDATE_AVAILABLE_FILE"
-    else
-      rm -f "$UPDATE_AVAILABLE_FILE"
-    fi
-    touch "$UPDATE_CHECK_FILE"
-  ) >/dev/null 2>&1 &
-  disown 2>/dev/null || true
-}
-
-# Pull claude-box's own flags out of "$@" before anything else looks at args,
-# so the project-dir positional and the claude-flag passthrough stay clean.
-# A literal `--` ends claude-box option parsing: everything after it goes to
-# claude verbatim, so a claude flag that happens to share a name with a
-# claude-box flag (--no-ssh, --upgrade, --ollama, --engine) can still be passed.
-NO_SSH=0
-UPGRADE=0
-OLLAMA_MODEL=""
-ENGINE_MODE=""
-BOX_NAME=""
-NAME_FILE=""
-declare -a _passthrough=()
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --) shift; _passthrough+=("$@"); break ;;
-    --no-ssh) NO_SSH=1 ;;
-    --upgrade) UPGRADE=1 ;;
-    --ollama)
-      shift
-      OLLAMA_MODEL="${1:-}"
-      [[ -n "$OLLAMA_MODEL" ]] || { printf '[claude-box] --ollama requires a model name\n' >&2; exit 1; }
-      ;;
-    --ollama=*) OLLAMA_MODEL="${1#*=}" ;;
-    --engine)
-      shift
-      ENGINE_MODE="${1:-}"
-      [[ -n "$ENGINE_MODE" ]] || { printf '[claude-box] --engine requires a mode (auto|sysbox|rootless|privileged-dind|none)\n' >&2; exit 1; }
-      ;;
-    --engine=*) ENGINE_MODE="${1#*=}" ;;
-    --name)
-      shift
-      BOX_NAME="${1:-}"
-      [[ -n "$BOX_NAME" ]] || { printf '[claude-box] --name requires a container name\n' >&2; exit 1; }
-      ;;
-    --name=*) BOX_NAME="${1#*=}" ;;
-    --name-file)
-      shift
-      NAME_FILE="${1:-}"
-      [[ -n "$NAME_FILE" ]] || { printf '[claude-box] --name-file requires a path\n' >&2; exit 1; }
-      ;;
-    --name-file=*) NAME_FILE="${1#*=}" ;;
-    *) _passthrough+=("$1") ;;
-  esac
-  shift
-done
-set -- "${_passthrough[@]+"${_passthrough[@]}"}"
-
-# A caller-supplied box name must satisfy docker's container-name charset; reject
-# early (before any docker call) with a precise message rather than letting
-# `docker run --name` fail obscurely mid-launch. Pre-flight usage error, so
-# exit 1 like the sibling flags, not the run-time fault()/125-127 path.
-if [[ -n "$BOX_NAME" && ! "$BOX_NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]]; then
-  printf '[claude-box] --name: invalid container name (allowed: [a-zA-Z0-9][a-zA-Z0-9_.-]*)\n' >&2
-  exit 1
-fi
-
-# There's no project-dir positional: claude-box always runs in the current
-# directory (the project root). Every remaining arg goes straight to claude.
-declare -a CLAUDE_ARGS=("$@")
-
-# Resolve symlinks so installs via `ln -sf ~/claude-box/claude-box /usr/local/bin/`
-# (or homebrew's /opt/homebrew/bin) still find the Dockerfile in the repo dir.
+# Resolve symlinks so an install via `ln -sf` still finds the repo dir.
 _self="${BASH_SOURCE[0]}"
 while [[ -L "$_self" ]]; do
   _link=$(readlink "$_self")
   [[ "$_link" = /* ]] && _self="$_link" || _self="$(dirname "$_self")/$_link"
 done
-CLAUDE_BOX_DIR="$(cd "$(dirname "$_self")" && pwd)"
-
-UPDATE_CHECK_FILE="${HOME}/.claude-box/.last-update-check"
-UPDATE_AVAILABLE_FILE="${HOME}/.claude-box/.update-available"
-mkdir -p "${HOME}/.claude-box"
-
-# --upgrade: pull latest claude-box and exit. Next regular run picks up any
-# Dockerfile/entrypoint changes via the mtime-vs-BUILT_MARKER check below.
-# Uses --ff-only so a dirty install dir errors out instead of silently merging.
-if [[ $UPGRADE -eq 1 ]]; then
-  log "upgrading claude-box at ${CLAUDE_BOX_DIR}..."
-  if git -C "$CLAUDE_BOX_DIR" pull --ff-only; then
-    rm -f "$UPDATE_AVAILABLE_FILE"
-    touch "$UPDATE_CHECK_FILE"
-    exit 0
-  else
-    exit $?
-  fi
-fi
-
-# Show cached update hint (zero-latency: just a file-existence check).
-[[ -e "$UPDATE_AVAILABLE_FILE" ]] && \
-  log "update available — run 'claude-box --upgrade' to pull latest"
-
-# If our cached check is missing or >24h old, kick off a fresh check in the
-# background. `find -mtime -1` is portable across BSD (macOS) and GNU find.
-if [[ ! -f "$UPDATE_CHECK_FILE" ]] || \
-   [[ -z "$(find "$UPDATE_CHECK_FILE" -mtime -1 2>/dev/null)" ]]; then
-  check_for_update_in_background
-fi
-
-PROJECT_DIR="$(pwd)"
-
-# Refuse to launch from $HOME (or any ancestor of it). PROJECT_DIR is
-# bind-mounted into the container, so launching from home would mount your
-# entire home directory into the box — a huge attack surface and a lot of
-# virtiofs traffic — and make ${HOME} a virtiofs mount root the entrypoint
-# can't chown (which used to kill the container outright). Runs before any
-# trap/launch, so a bare exit here is clean.
-_home="$(cd "$HOME" 2>/dev/null && pwd)"
-if [[ -n "$_home" && ( "$PROJECT_DIR" == "$_home" || "$_home" == "$PROJECT_DIR"/* ) ]]; then
-  printf '[claude-box] refusing to launch from %s\n' "$PROJECT_DIR" >&2
-  printf '[claude-box] this would bind-mount your entire home directory (%s) into the box.\n' "$_home" >&2
-  printf '[claude-box] cd into a specific project directory and run claude-box from there.\n' >&2
-  exit 1
-fi
+BOX_SRC_DIR="$(cd "$(dirname "$_self")" && pwd)"
 
 CLAUDE_HOME="${HOME}/.claude"
-IMAGE="claude-box"
-DOCKERFILE="${CLAUDE_BOX_DIR}/Dockerfile"
-ENTRYPOINT_SH="${CLAUDE_BOX_DIR}/entrypoint.sh"
-USERNS_PROBE_SH="${CLAUDE_BOX_DIR}/userns-probe.sh"
-BUILT_MARKER="${HOME}/.claude-box/.built"
 
-# A caller-supplied --name wins; otherwise the default stays unique per launcher
-# via the PID, so concurrent boxes never collide.
-CONTAINER_NAME="${BOX_NAME:-claude-box-$(basename "$PROJECT_DIR")-$$}"
+# --- cage config ---
+BOX_LABEL="claude-box"
+BOX_IMAGE="claude-box"
+BOX_DOCKERFILE="${BOX_SRC_DIR}/Dockerfile.claude"
+BOX_STATE_DIR="${HOME}/.claude-box/state"
+BOX_STATE_MOUNT="${CLAUDE_HOME}"
+BOX_ENV_PREFIX="CLAUDE_BOX"
+BOX_FORWARD_VARS=(ANTHROPIC_API_KEY LINEAR_API_KEY)
+BOX_PAYLOAD_CMD=(claude --dangerously-skip-permissions)
+# Extra files Dockerfile.claude COPYs, so editing them forces an image rebuild.
+BOX_BUILD_INPUTS=("${BOX_SRC_DIR}/payload-init-claude.sh" "${BOX_SRC_DIR}/claude-box-theme.json")
 
-# Build the image if it doesn't exist or any build input has changed. Includes
-# entrypoint.sh because it's COPYed into the image, so changes there need a
-# rebuild even when the Dockerfile itself is unchanged.
-needs_build=0
-if ! docker image inspect "$IMAGE" &>/dev/null; then
-  needs_build=1
-elif [[ "$DOCKERFILE" -nt "$BUILT_MARKER" || "$ENTRYPOINT_SH" -nt "$BUILT_MARKER" \
-        || "$USERNS_PROBE_SH" -nt "$BUILT_MARKER" ]]; then
-  needs_build=1
-fi
-if [[ $needs_build -eq 1 ]]; then
-  log "building image..."
-  if ! docker build -f "$DOCKERFILE" -t "$IMAGE" "$CLAUDE_BOX_DIR"; then
-    fault image-missing "docker build failed for image '${IMAGE}'"
-    exit 125
-  fi
-  mkdir -p "$(dirname "$BUILT_MARKER")"
-  touch "$BUILT_MARKER"
-fi
+OLLAMA_MODEL=""
 
-# The image must exist before we run. If inspect still can't see it — a build
-# skipped as unneeded but the image was removed out-of-band, or a build that
-# produced nothing — that's an image-missing launcher fault (125), caught here
-# (before the container ever launches) so runtime 125s can mean engine failure.
-if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
-  fault image-missing "image '${IMAGE}' is not present (build it or check the docker daemon)"
-  exit 125
-fi
+# shellcheck source=libcage.sh
+source "${BOX_SRC_DIR}/libcage.sh"
 
-# Persistent state dir — preserves settings, conversation history, etc. across
-# runs so Claude Code doesn't re-run setup on every launch. Delete to reset.
-STATE_DIR="${HOME}/.claude-box/state"
-mkdir -p "$STATE_DIR"
-chmod 777 "$STATE_DIR"
-
-_SSH_RELAY_PID=""
-cleanup() {
-  if [[ -n "$_SSH_RELAY_PID" ]]; then
-    kill "$_SSH_RELAY_PID" 2>/dev/null || true
-    wait "$_SSH_RELAY_PID" 2>/dev/null || true
-  fi
-  # The published handle is only valid while the box lives (the container is
-  # --rm), so remove it on exit rather than leave a name pointing at nothing.
-  [[ -n "$NAME_FILE" ]] && rm -f "$NAME_FILE"
+# --- wrapper flag: --ollama <model> ---
+box_parse_arg() {
+  case "$1" in
+    --ollama)
+      OLLAMA_MODEL="${2:-}"
+      [[ -n "$OLLAMA_MODEL" ]] || { printf '[claude-box] --ollama requires a model name\n' >&2; exit 1; }
+      _CONSUMED=2; return 0 ;;
+    --ollama=*) OLLAMA_MODEL="${1#*=}"; _CONSUMED=1; return 0 ;;
+  esac
+  return 1
 }
 
-# Flush sessions, credentials, and satellite state from the container back to the
-# host, write any refreshed token back to the Keychain, and print the resume
-# hint. Runs from the EXIT trap (and via the signal traps below), so a DROPPED
-# session — terminal/SSH close, sleep, kill — flushes to the host's native Claude
-# dir and gets the Colima virtiofs coherence pass exactly like a clean exit,
-# instead of stranding the transcript in the state dir. The helper container
-# works over the state volume, so it doesn't need the (already --rm'd) session
-# container. Guarded to run at most once, and only if the container was launched.
-_LAUNCHED=0
-_SYNCED=0
-sync_back() {
-  [[ "${_LAUNCHED:-0}" == 1 && "${_SYNCED:-0}" == 0 ]] || return 0
-  _SYNCED=1
-  set +euo pipefail
-
-  # Never copy out from a container that's still writing to the state volume. On
-  # a headless run no PTY absorbs the signal, so a supervisor's SIGINT/TERM/HUP
-  # can reach this launcher and fire the EXIT trap while the session container is
-  # still live — snapshotting half-flushed state. Stop it (with a short grace so
-  # the harness can flush) and wait before touching the volume. On a clean exit
-  # the container has already `--rm`'d itself, so `docker inspect` misses and
-  # this is a fast no-op — the interactive -it path routed the signal to the
-  # container, not here, so it too arrives with the container already gone.
-  if docker inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
-    docker stop -t 2 "$CONTAINER_NAME" >/dev/null 2>&1 || true
-  fi
-
-  _state_proj="${STATE_DIR}/projects/${PROJECT_SLUG}"
-
-  # On Colima, files written by the container may not be visible on the host due
-  # to virtiofs caching. Copy them out through Docker's I/O path via a helper
-  # container — the host can't see them directly.
-  if [[ "${DOCKER_HOST:-}" == */.colima/* ]]; then
-    log "syncing state back from colima..."
-    _cid=$(docker create --entrypoint sleep -v "${STATE_DIR}:/_state:rw" "${IMAGE}" 1 2>/dev/null)
-    if [[ -n "$_cid" ]]; then
-      # Sessions, .claude.json, credentials, and satellite state (tasks, todos, etc.)
-      docker cp "${_cid}:/_state/projects/${PROJECT_SLUG}/." "${_state_proj}/" 2>/dev/null || true
-      docker cp "${_cid}:/_state/.claude.json" "${STATE_DIR}/.claude.json" 2>/dev/null || true
-      docker cp "${_cid}:/_state/.credentials.json" "${STATE_DIR}/.credentials.json" 2>/dev/null || true
-      for _sat in tasks session-env shell-snapshots paste-cache plans file-history; do
-        docker cp "${_cid}:/_state/${_sat}/." "${STATE_DIR}/${_sat}/" 2>/dev/null || true
-      done
-      docker rm -f "$_cid" >/dev/null 2>&1 || true
-    fi
-  fi
-
-  # Write an in-box token refresh back to the macOS Keychain so host Claude — and
-  # the next launch's seed — pick it up instead of re-seeding a now-rotated (dead)
-  # refresh token, the usual cause of intermittent logouts. Newer-wins by
-  # expiresAt so a concurrent host refresh isn't clobbered. Only updates an
-  # existing Keychain item (never creates a duplicate) and only for a real
-  # claudeAiOauth token.
-  if command -v security >/dev/null 2>&1 \
-     && [[ -s "${STATE_DIR}/.credentials.json" ]] \
-     && grep -q '"claudeAiOauth"' "${STATE_DIR}/.credentials.json" 2>/dev/null; then
-    _state_exp=$(_cred_expiry < "${STATE_DIR}/.credentials.json")
-    _kc_exp=0
-    if _kc_now=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null) \
-       && [[ "$_kc_now" == *claudeAiOauth* ]]; then
-      _kc_exp=$(printf '%s' "$_kc_now" | _cred_expiry)
-    fi
-    _kc_acct=$(security find-generic-password -s "Claude Code-credentials" 2>/dev/null \
-      | sed -n 's/^[[:space:]]*"acct"<blob>="\(.*\)"$/\1/p')
-    if [[ -n "$_kc_acct" && "${_state_exp:-0}" -gt "${_kc_exp:-0}" ]]; then
-      security add-generic-password -U -s "Claude Code-credentials" -a "$_kc_acct" \
-        -w "$(cat "${STATE_DIR}/.credentials.json")" 2>/dev/null \
-        && log "synced refreshed Claude token back to Keychain" || true
-    fi
-  fi
-
-  # Copy sessions to the host's Claude project dir for cross-tool resumability.
-  # Preserve mtimes (-p): the resume hint below picks the just-closed session by
-  # newest mtime, and a plain cp stamps every file with the copy time — which
-  # collapses all sessions to one timestamp and makes the pick arbitrary (it
-  # falls back to glob/alphabetical order, reporting a stale unrelated session).
-  cp -pf "${_state_proj}/"*.jsonl "$HOST_PROJECT_SESSIONS/" 2>/dev/null
-  cp -prf "${_state_proj}/"*/ "$HOST_PROJECT_SESSIONS/" 2>/dev/null
-
-  # Resume hint: the just-closed session is the newest transcript by mtime. Scan
-  # both the synced state dir (authoritative on Colima — docker cp keeps real
-  # mtimes) and the host dir (where the live override-mount writes on other
-  # runtimes) so whichever holds the real session wins even if one copy missed —
-  # that double source is also why the hint still prints on a fresh project when
-  # only one of the two dirs got populated. Skip agent-*.jsonl: those are
-  # subagent sidechains, not resumable sessions.
-  _latest=""
-  for f in "${_state_proj}/"*.jsonl "${HOST_PROJECT_SESSIONS}/"*.jsonl; do
-    [[ -f "$f" ]] || continue
-    case "${f##*/}" in agent-*) continue ;; esac
-    [[ -z "$_latest" || "$f" -nt "$_latest" ]] && _latest="$f"
-  done
-  if [[ -n "$_latest" ]]; then
-    _id=$(basename "$_latest" .jsonl)
-    _resume_cmd="claude-box -r ${_id}"
-    printf '[claude-box] to resume: %s\n' "$_resume_cmd" >&2
-    # Also persist the hint: a dropped session (terminal/SSH closed) runs this
-    # trap with a stderr that's already gone, so the line above is computed and
-    # lost. Stash it so the next launch in this project can surface it.
-    printf '%s\n' "$_resume_cmd" > "${_state_proj}/.last-resume" 2>/dev/null || true
-  fi
-}
-
-# Run sync_back on any exit, and convert a closed terminal (HUP), kill (TERM), or
-# Ctrl-C during the sync phase (INT) into a graceful exit so it still fires. A
-# pending signal trap runs the instant `docker run` returns, so sync_back must
-# already be defined by then — hence it lives here, above the run. During the
-# interactive `docker run -it` the PTY is in raw mode, so the user's in-Claude
-# Ctrl-C goes to the container, not to this launcher. On a HEADLESS run there's
-# no PTY, so a supervisor's signal lands here while the container may still be
-# live; sync_back stops the container before copying out (see its guard), so the
-# copy-out never races a running container regardless of the signal path.
-trap 'sync_back; cleanup' EXIT
-trap 'exit' INT TERM HUP
-
-# Per-project overrides: source ${PROJECT_DIR}/.env.claude-box if present so
-# each project can supply its own values (e.g. a project-specific LINEAR_API_KEY)
-# without having to re-export them in the calling shell. Sourced BEFORE
-# FORWARD_VARS is built so the file can also extend CLAUDE_BOX_EXTRA_VARS.
-# Values here win over whatever's in the host shell. set -a auto-exports each
-# assignment so plain KEY=value lines work without needing `export`.
-PROJECT_ENV_FILE="${PROJECT_DIR}/.env.claude-box"
-if [[ -f "$PROJECT_ENV_FILE" ]]; then
-  set -a
-  # shellcheck disable=SC1090
-  source "$PROJECT_ENV_FILE"
-  set +a
-fi
-
-# Nested container engine posture (ADR-0041 decision 3). The box gets its own
-# engine INSIDE the cage so its authority is bounded by the cage; the host
-# docker socket is never mounted (the entrypoint refuses to start if one is).
-# Ladder: sysbox (best — rootful engine bounded by the sysbox runtime) →
-# rootless dind (default — unprivileged dockerd in a nested userns; needs
-# seccomp/apparmor unconfined on the OUTER container to allow userns + mounts,
-# but adds no capabilities and stays non-privileged) → privileged-dind (the
-# named weaker posture, explicit opt-in only) → none.
-# CLI --engine wins; else CLAUDE_BOX_ENGINE_MODE (env or .env.claude-box);
-# else auto.
-ENGINE_MODE="${ENGINE_MODE:-${CLAUDE_BOX_ENGINE_MODE:-auto}}"
-_host_docker_caps=""
-if [[ "$ENGINE_MODE" != "none" ]]; then
-  # One docker info call answers both: is sysbox-runc a host runtime, and
-  # does the host enforce apparmor (only then is apparmor=unconfined valid —
-  # passing it on a non-apparmor host errors at container create).
-  _host_docker_caps="$(docker info --format '{{.SecurityOptions}} {{range $k, $v := .Runtimes}}{{$k}} {{end}}' 2>/dev/null || true)"
-fi
-case "$ENGINE_MODE" in
-  auto)
-    if [[ "$_host_docker_caps" == *sysbox-runc* ]]; then ENGINE=sysbox; else ENGINE=rootless; fi
-    ;;
-  sysbox)
-    if [[ "$_host_docker_caps" != *sysbox-runc* ]]; then
-      fault engine-start-failed "--engine sysbox: host docker has no sysbox-runc runtime (install sysbox first)"
-      exit 126
-    fi
-    ENGINE=sysbox
-    ;;
-  rootless|privileged-dind|none) ENGINE="$ENGINE_MODE" ;;
-  *)
-    printf '[claude-box] unknown --engine mode: %s (want auto|sysbox|rootless|privileged-dind|none)\n' "$ENGINE_MODE" >&2
-    exit 1
-    ;;
-esac
-
-# Per-docker-host slug for cache files: probe results are properties of the
-# docker host (VM), so a Colima↔Docker-Desktop switch must not reuse them.
-_dh_slug="$(printf '%s' "${DOCKER_HOST:-default}" | tr -c 'a-zA-Z0-9' '_')"
-
-# Probe whether the host daemon can map a device node into containers; cached
-# per docker host. /dev/fuse backs fuse-overlayfs (the storage fallback on
-# kernels without rootless-overlay2); /dev/net/tun backs slirp4netns (the
-# rootless engine's network). A missing tun device means the rootless engine
-# can't network — surfaced by the entrypoint's ready check.
-_probe_device() {
-  local dev="$1" cache="${HOME}/.claude-box/.device-probe-${1//\//_}-${_dh_slug}"
-  if [[ ! -f "$cache" ]]; then
-    if docker run --rm --entrypoint true --device "$dev" "$IMAGE" >/dev/null 2>&1; then
-      echo yes > "$cache"
-    else
-      echo no > "$cache"
-    fi
-  fi
-  [[ "$(cat "$cache" 2>/dev/null)" == yes ]]
-}
-
-# AppArmor profile granting the cage CAPABLE user namespaces. Ubuntu-lineage
-# kernels (Colima VMs, Ubuntu 23.10+) set apparmor_restrict_unprivileged_userns:
-# an unconfined unprivileged process may create a userns but is stripped of
-# capabilities inside it, which kills rootlesskit. The blessed fix is a profile
-# carrying the `userns,` permission; flags=(unconfined) means it confines
-# nothing else. Loaded via the host's own apparmor_parser (guaranteed present
-# when apparmor is enforced — dockerd needs it for docker-default) through a
-# privileged one-shot helper that nsenters the host mount namespace. That
-# helper is launcher-side HOST-altitude setup by the human-run wrapper — the
-# cage itself never gets this authority.
-_USERNS_PROFILE='abi <abi/4.0>,
-include <tunables/global>
-profile claude-box-engine flags=(unconfined) {
-  userns,
-}'
-
-# Idempotent, ~300ms. Re-run each launch when needed: loaded profiles do not
-# survive a docker-host (VM) reboot.
-_load_userns_profile() {
-  printf '%s\n' "$_USERNS_PROFILE" | docker run --rm -i --privileged --pid=host \
-    --entrypoint nsenter "$IMAGE" -t 1 -m -- sh -c \
-    'cat > /run/claude-box-engine.profile && apparmor_parser -Kr /run/claude-box-engine.profile' \
-    >/dev/null 2>&1
-}
-
-# Run the baked-in userns probe (unshare + parent-side newuidmap, i.e. what
-# rootlesskit does at boot) under candidate security options.
-_userns_probe() {
-  docker run --rm --entrypoint /usr/local/bin/claude-box-userns-probe \
-    --security-opt seccomp=unconfined "$@" "$IMAGE" >/dev/null 2>&1
-}
-
-# Pick the WEAKEST relaxation set that yields a capable nested userns:
-#   plain        seccomp=unconfined (+ apparmor=unconfined on apparmor hosts)
-#   profile      + the claude-box-engine apparmor profile (userns permission)
-#   profile-cap  + CAP_SYS_ADMIN in the bounding set (Ubuntu-restricted kernels
-#                need it for setuid newuidmap's parent-side map write; latent —
-#                unprivileged cage processes only reach it via those helpers)
-#   cap          SYS_ADMIN alone (restricted kernel, no apparmor mediation)
-# Cached per docker host; "unsupported" is never cached so a host fix is
-# picked up on the next launch. Delete ~/.claude-box/.userns-strategy-* to
-# force a re-probe.
-_resolve_userns_strategy() {
-  local cache="${HOME}/.claude-box/.userns-strategy-${_dh_slug}" s="" aa=()
-  if [[ -s "$cache" ]]; then
-    cat "$cache"
-    return 0
-  fi
-  [[ "$_host_docker_caps" == *apparmor* ]] && aa=(--security-opt apparmor=unconfined)
-  if _userns_probe ${aa[@]+"${aa[@]}"}; then
-    s="plain"
-  elif [[ "$_host_docker_caps" == *apparmor* ]] && _load_userns_profile; then
-    if _userns_probe --security-opt apparmor=claude-box-engine; then
-      s="profile"
-    elif _userns_probe --security-opt apparmor=claude-box-engine --cap-add SYS_ADMIN; then
-      s="profile-cap"
-    fi
-  fi
-  if [[ -z "$s" ]] && _userns_probe ${aa[@]+"${aa[@]}"} --cap-add SYS_ADMIN; then
-    s="cap"
-  fi
-  if [[ -n "$s" ]]; then
-    echo "$s" > "$cache"
-    echo "$s"
-  else
-    echo "unsupported"
-  fi
-}
-
-engine_args=()
-case "$ENGINE" in
-  sysbox)
-    # Sysbox provisions the inner engine's storage and devices itself; the
-    # data-root volume below would defeat its uid-shifting, so pass none.
-    engine_args+=(--runtime sysbox-runc -e "CLAUDE_BOX_ENGINE=rootful" --init)
-    log "engine: sysbox (rootful nested dockerd, bounded by sysbox-runc)"
-    ;;
-  rootless)
-    # The anonymous volume at the data root keeps the nested engine's storage
-    # off the container overlayfs (overlay-on-overlay is rejected) — --rm
-    # removes it with the container, so engine state is per-session.
-    # systempaths=unconfined unmasks /proc inside the cage: rootlesskit must
-    # write net.ipv4.ip_forward in its OWN detached netns through /proc/sys,
-    # which docker bind-mounts read-only in every non-privileged container.
-    engine_args+=(
-      --security-opt seccomp=unconfined
-      --security-opt systempaths=unconfined
-      -e "CLAUDE_BOX_ENGINE=rootless"
-      -v /var/lib/claude-box-engine
-      --init
-    )
-    _userns_strategy="$(_resolve_userns_strategy)"
-    case "$_userns_strategy" in
-      plain)
-        [[ "$_host_docker_caps" == *apparmor* ]] && engine_args+=(--security-opt apparmor=unconfined)
-        ;;
-      profile|profile-cap)
-        _load_userns_profile || warn "apparmor profile load failed: engine may not start"
-        engine_args+=(--security-opt apparmor=claude-box-engine)
-        [[ "$_userns_strategy" == profile-cap ]] && engine_args+=(--cap-add SYS_ADMIN)
-        ;;
-      cap)
-        engine_args+=(--cap-add SYS_ADMIN)
-        ;;
-      unsupported)
-        warn "this docker host cannot give an unprivileged user a capable user"
-        warn "namespace, so the rootless nested engine will likely fail to start."
-        warn "consider sysbox, or '--engine privileged-dind' (ADR-0041's named"
-        warn "weaker posture), or '--engine none'."
-        [[ "$_host_docker_caps" == *apparmor* ]] && engine_args+=(--security-opt apparmor=unconfined)
-        ;;
-    esac
-    _probe_device /dev/net/tun && engine_args+=(--device /dev/net/tun)
-    _probe_device /dev/fuse && engine_args+=(--device /dev/fuse)
-    log "engine: rootless nested dockerd (userns strategy: ${_userns_strategy})"
-    ;;
-  privileged-dind)
-    warn "--engine privileged-dind is ADR-0041's named weaker posture:"
-    warn "a privileged cage weakens host isolation. Prefer sysbox or rootless."
-    engine_args+=(--privileged -e "CLAUDE_BOX_ENGINE=rootful" -v /var/lib/docker --init)
-    ;;
-  none)
-    engine_args+=(-e "CLAUDE_BOX_ENGINE=none")
-    log "engine: none (no container engine inside the box)"
-    ;;
-esac
-
-# Env vars to forward into the container.
-# Add project-specific vars by setting CLAUDE_BOX_EXTRA_VARS, either in your
-# shell before invoking or inside the project's .env.claude-box:
-#   CLAUDE_BOX_EXTRA_VARS=(TURSO_AUTH_TOKEN MY_API_KEY) claude-box
-# Forward TERM + COLORFGBG only if the host shell has them set — don't synthesize
-# defaults. Claude Code's theme auto-detect works correctly when the container
-# inherits exactly what iTerm2 (or whatever terminal) provides, and synthesizing
-# values has surprising side effects.
-# Specifically, do NOT set COLORTERM=truecolor in the docker run env — even
-# though the terminal supports it, forcing it in the container causes Claude
-# Code's palette derivation to pick a broken combo (white-on-white prompt and
-# response text). Let the terminal advertise its own capabilities through
-# whatever vars iTerm2 already exports.
-FORWARD_VARS=(
-  ANTHROPIC_API_KEY
-  GITHUB_TOKEN
-  GITHUB_PERSONAL_ACCESS_TOKEN
-  LINEAR_API_KEY
-  TERM
-  COLORFGBG
-  CLAUDE_BOX_DEBUG   # opt-in entrypoint state dump (off by default)
-  CLAUDE_BOX_EXEC    # acceptance hook: exec the args as a raw command, not claude
-  "${CLAUDE_BOX_EXTRA_VARS[@]+"${CLAUDE_BOX_EXTRA_VARS[@]}"}"
-)
-
-env_args=()
-for var in "${FORWARD_VARS[@]}"; do
-  [[ -n "${!var:-}" ]] && env_args+=(-e "${var}=${!var}")
-done
-
-# --ollama <model>: route Claude Code at an Ollama server's Anthropic-compatible
-# API (mirrors `ollama launch claude --model X`). The base URL comes from
-# OLLAMA_HOST so it follows wherever that already points — a Tailscale peer, a
-# LAN box, or localhost — all reachable from the container over the normal
-# bridge network (no host networking needed). OLLAMA_HOST may omit the scheme
-# (Ollama's own convention), so add http:// when absent. ANTHROPIC_AUTH_TOKEN is
-# a dummy Ollama ignores but Claude Code requires to be non-empty. Both the main
-# and small/fast models point at the same model so background calls don't fall
-# back to a claude-* name the server doesn't have.
-if [[ -n "$OLLAMA_MODEL" ]]; then
-  _ollama_url="${OLLAMA_HOST:-localhost:11434}"
-  [[ "$_ollama_url" == http://* || "$_ollama_url" == https://* ]] || _ollama_url="http://${_ollama_url}"
-  env_args+=(
-    -e "ANTHROPIC_BASE_URL=${_ollama_url}"
-    -e "ANTHROPIC_AUTH_TOKEN=ollama"
-    -e "ANTHROPIC_MODEL=${OLLAMA_MODEL}"
-    -e "ANTHROPIC_SMALL_FAST_MODEL=${OLLAMA_MODEL}"
-  )
-  log "ollama mode: ${_ollama_url} (model: ${OLLAMA_MODEL})"
-fi
-
-# Concatenate CLAUDE.md files: global base → parent dirs → project (project wins).
-# Written directly into the state dir so it's part of the main volume mount —
-# no separate bind mount that could fail on Colima when virtiofs hasn't synced.
-: > "${STATE_DIR}/CLAUDE.md"
-
-if [[ -f "${CLAUDE_HOME}/CLAUDE.md" ]]; then
-  cat "${CLAUDE_HOME}/CLAUDE.md" >> "${STATE_DIR}/CLAUDE.md"
-fi
-
-declare -a claude_files=()
-current="$PROJECT_DIR"
-while [[ "$current" != "/" ]]; do
-  [[ -f "$current/CLAUDE.md" ]] && claude_files+=("$current/CLAUDE.md")
-  current="$(dirname "$current")"
-done
-
-for (( i=${#claude_files[@]}-1; i>=0; i-- )); do
-  f="${claude_files[$i]}"
-  printf '\n<!-- %s -->\n' "$f" >> "${STATE_DIR}/CLAUDE.md"
-  cat "$f" >> "${STATE_DIR}/CLAUDE.md"
-done
-
-# Concatenate AGENTS.md the same way: global ~/.agents/AGENTS.md → parent dirs →
-# project (project wins). The user's CLAUDE.md tells Claude to read
-# ~/.agents/AGENTS.md, and projects carry their own AGENTS.md, so the box needs
-# the merged view — not just the global file. Staged in the state dir (the one
-# reliably-synced mount) for the entrypoint to copy out to ~/.agents/AGENTS.md.
-mkdir -p "${STATE_DIR}/.agents"
-: > "${STATE_DIR}/.agents/AGENTS.md"
-
-if [[ -f "${HOME}/.agents/AGENTS.md" ]]; then
-  cat "${HOME}/.agents/AGENTS.md" >> "${STATE_DIR}/.agents/AGENTS.md"
-fi
-
-declare -a agents_files=()
-current="$PROJECT_DIR"
-while [[ "$current" != "/" ]]; do
-  [[ -f "$current/AGENTS.md" ]] && agents_files+=("$current/AGENTS.md")
-  current="$(dirname "$current")"
-done
-
-for (( i=${#agents_files[@]}-1; i>=0; i-- )); do
-  f="${agents_files[$i]}"
-  printf '\n<!-- %s -->\n' "$f" >> "${STATE_DIR}/.agents/AGENTS.md"
-  cat "$f" >> "${STATE_DIR}/.agents/AGENTS.md"
-done
-
-# Specific ~/.claude entries to bind-mount on top of the state volume.
-# Pre-create the mount-point directories/files as host-user-owned so Docker
-# doesn't create them as root (which would leave root-owned paths in STATE_DIR
-# that the cleanup trap can't delete).
-# Extract gh CLI token from the host (keychain-backed on macOS) and forward it
-# as GH_TOKEN so `gh` works inside the container without re-authing.
-if [[ -z "${GH_TOKEN:-}" ]]; then
-  log "fetching gh auth token..."
-  GH_TOKEN=$(gh auth token 2>/dev/null) && env_args+=(-e "GH_TOKEN=${GH_TOKEN}") || true
-fi
-
-declare -a override_mounts=()
-
-# Mount SSH keys + forward ssh-agent so git-over-SSH and signing work inside
-# the container. Agent forwarding means the host's already-unlocked key is used
-# directly — no passphrase prompt per commit. Skipped if --no-ssh was passed.
-#
-# macOS socket paths vary by runtime:
-#   - Docker Desktop: can't bind-mount /private/tmp/com.apple.launchd.* sockets
-#     but exposes a magic /run/host-services/ssh-auth.sock proxy.
-#   - Colima: virtiofs can't expose Unix sockets at all. We relay the host agent
-#     over TCP (Python on host → socat in container) so the container gets a
-#     working SSH_AUTH_SOCK without needing the VM to see the socket file.
-#   - OrbStack: full macOS filesystem access, all paths work directly.
-# 1Password's socket (~/.1password/agent.sock) is under $HOME and works everywhere.
-if [[ $NO_SSH -eq 0 ]]; then
-  [[ -d "${HOME}/.ssh" ]] && override_mounts+=(-v "${HOME}/.ssh:${HOME}/.ssh:ro")
-  if [[ -n "${SSH_AUTH_SOCK:-}" && -S "$SSH_AUTH_SOCK" ]]; then
-    if [[ "${DOCKER_HOST:-}" == */.colima/* ]]; then
-      # Colima: start a TCP relay on the host that proxies to the agent socket.
-      # The container's entrypoint converts it back to a Unix socket via socat.
-      # We write the port to a temp file instead of capturing stdout via $()
-      # because $(cmd &) hangs waiting for the pipe to drain and $! inside $()
-      # doesn't propagate to the parent shell.
-      _relay_port_file=$(mktemp /tmp/claude-box-relay.XXXXXX)
-      python3 -c "
-import socket, sys, threading, signal, os
-src = '${SSH_AUTH_SOCK}'
-server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-server.bind(('127.0.0.1', 0))
-port = server.getsockname()[1]
-with open('${_relay_port_file}', 'w') as f:
-    f.write(str(port))
-server.listen(8)
-signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-def relay(a, b):
-    try:
-        while d := a.recv(4096): b.sendall(d)
-    except: pass
-    finally: a.close(); b.close()
-while True:
-    c, _ = server.accept()
-    u = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    u.connect(src)
-    threading.Thread(target=relay, args=(c, u), daemon=True).start()
-    threading.Thread(target=relay, args=(u, c), daemon=True).start()
-" &
-      _SSH_RELAY_PID=$!
-      # Poll until the relay writes its port (up to 3 s). A fixed sleep raced
-      # against Python startup — if the read beat the write, the container got
-      # an empty CLAUDE_BOX_SSH_RELAY_PORT and no SSH_AUTH_SOCK.
-      _RELAY_PORT=""
-      for _i in $(seq 1 30); do
-        [[ -s "$_relay_port_file" ]] && { _RELAY_PORT=$(<"$_relay_port_file"); break; }
-        sleep 0.1
-      done
-      rm -f "$_relay_port_file"
-      if [[ -z "$_RELAY_PORT" ]]; then
-        warn "SSH agent relay failed to start: signing will not work"
-        kill "$_SSH_RELAY_PID" 2>/dev/null || true
-        _SSH_RELAY_PID=""
-      else
-        env_args+=(-e "CLAUDE_BOX_SSH_RELAY_PORT=${_RELAY_PORT}")
-        env_args+=(--add-host "host.docker.internal:host-gateway")
-      fi
-    elif [[ "$SSH_AUTH_SOCK" == /private/tmp/com.apple.launchd.* ]]; then
-      # Docker Desktop can't mount launchd sockets — use its built-in proxy
-      override_mounts+=(-v "/run/host-services/ssh-auth.sock:/run/host-services/ssh-auth.sock")
-      env_args+=(-e "SSH_AUTH_SOCK=/run/host-services/ssh-auth.sock")
-    else
-      # OrbStack and Linux: mount the socket directly
-      override_mounts+=(-v "${SSH_AUTH_SOCK}:${SSH_AUTH_SOCK}")
-      env_args+=(-e "SSH_AUTH_SOCK=${SSH_AUTH_SOCK}")
-    fi
-  fi
-else
-  log "ssh disabled (--no-ssh): no key mount, no agent forwarding"
-fi
-
-# Mount host ~/.gitconfig read-only so user name/email, aliases, signing config,
-# etc. carry into the container. On Colima, copy into state dir instead (virtiofs
-# can't see single host files reliably for bind mounts).
-if [[ -f "${HOME}/.gitconfig" ]]; then
-  if [[ "${DOCKER_HOST:-}" == */.colima/* ]]; then
-    cp -f "${HOME}/.gitconfig" "${STATE_DIR}/.gitconfig" 2>/dev/null || true
-  else
-    override_mounts+=(-v "${HOME}/.gitconfig:${HOME}/.gitconfig:ro")
-  fi
-fi
-
-# Share XDG cache (pip wheels, npm/yarn tarballs, playwright browsers, etc.) so
-# first-run downloads survive container exit and are shared across boxes.
-# mkdir -p so Docker doesn't create a root-owned dir on a host without ~/.cache.
-mkdir -p "${HOME}/.cache"
-override_mounts+=(-v "${HOME}/.cache:${HOME}/.cache")
-
-# Share ~/.local/bin so tools installed inside the box (pip/uv --user, etc.)
-# survive container exit. The entrypoint puts this on PATH. mkdir -p so Docker
-# doesn't create a root-owned dir when the host has no ~/.local/bin yet.
-mkdir -p "${HOME}/.local/bin"
-override_mounts+=(-v "${HOME}/.local/bin:${HOME}/.local/bin")
-
-# Per-project session sharing: bind-mount just this project's session dir from
-# the host so sessions started in claude-box are resumable from host Claude
-# (and vice versa). Scoped to the current project so other projects' history
-# stays isolated in the state volume. Claude encodes project paths by replacing
-# `/` with `-`; we mirror that to find the matching subdir.
-PROJECT_SLUG="${PROJECT_DIR//\//-}"
-HOST_PROJECT_SESSIONS="${CLAUDE_HOME}/projects/${PROJECT_SLUG}"
-mkdir -p "$HOST_PROJECT_SESSIONS"
-mkdir -p "${STATE_DIR}/projects/${PROJECT_SLUG}"
-
-# Surface the previous run's resume hint if the last session was dropped — its
-# stderr was gone when sync_back printed, so the line never reached the user.
-# Show it once, then clear it so it doesn't linger across future launches.
-_last_resume_file="${STATE_DIR}/projects/${PROJECT_SLUG}/.last-resume"
-if [[ -s "$_last_resume_file" ]]; then
-  log "last session: $(cat "$_last_resume_file")"
-  rm -f "$_last_resume_file" 2>/dev/null || true
-fi
-# On Colima, skip the override mount — the freshly-created host dir isn't
-# visible to the VM, so Docker creates an empty ephemeral directory instead.
-# Sessions fall through to the state dir's projects folder, and we sync them
-# back to the host after docker exits.
-if [[ "${DOCKER_HOST:-}" != */.colima/* ]]; then
-  override_mounts+=(-v "${HOST_PROJECT_SESSIONS}:${HOST_PROJECT_SESSIONS}")
-fi
-
-# Session-keyed satellite state. Each of these dirs holds one entry per session
-# UUID (todos, shell env snapshots, pastes, plan-mode drafts, file-edit
-# history). Sharing them with the host means a session started in claude-box
-# resumes in host Claude — and vice versa — with full fidelity, not just the
-# conversation transcript. Trade-off: because entries are keyed by session UUID
-# (not project), the container can see satellite state for sessions from other
-# projects. No corruption risk; UUIDs don't collide. mkdir -p so a fresh host
-# without these dirs doesn't end up with root-owned mount points.
-for entry in tasks session-env shell-snapshots paste-cache plans file-history; do
-  mkdir -p "${CLAUDE_HOME}/${entry}"
-  # On Colima, skip these override mounts — virtiofs can't see the host dirs.
-  # The state dir already has these paths and they'll be synced back after exit.
-  if [[ "${DOCKER_HOST:-}" != */.colima/* ]]; then
-    override_mounts+=(-v "${CLAUDE_HOME}/${entry}:${CLAUDE_HOME}/${entry}")
-  fi
-done
-
-# Per-project extra mounts. Set CLAUDE_BOX_EXTRA_MOUNTS in .env.claude-box (or
-# the calling shell) to an array of host:container[:opts] specs, e.g.:
-#   CLAUDE_BOX_EXTRA_MOUNTS=("$HOME/.aws:$HOME/.aws:ro" "/data:/data")
-for spec in "${CLAUDE_BOX_EXTRA_MOUNTS[@]+"${CLAUDE_BOX_EXTRA_MOUNTS[@]}"}"; do
-  override_mounts+=(-v "$spec")
-done
-
-# On non-Colima runtimes, overlay-mount host ~/.claude entries on top
-# of the state dir so the container always reflects the host's current setup.
-# On Colima, these mounts silently fail (virtiofs can't see the host dirs), so
-# we skip them here and sync into the state dir later via host-side cp + flush.
-if [[ "${DOCKER_HOST:-}" != */.colima/* ]]; then
-  for entry in plugins skills hooks .mcp.json; do
-    if [[ -e "${CLAUDE_HOME}/${entry}" ]]; then
-      if [[ -d "${CLAUDE_HOME}/${entry}" ]]; then
-        mkdir -p "${STATE_DIR}/${entry}"
-      else
-        touch "${STATE_DIR}/${entry}"
-      fi
-      override_mounts+=(-v "${CLAUDE_HOME}/${entry}:${CLAUDE_HOME}/${entry}:rw")
-    fi
-  done
-
-  # Symlinked skills point to absolute paths outside ~/.claude (e.g. other repos).
-  # Collect the unique parent dirs of all symlink targets and mount them rw
-  # so those paths resolve inside the container and skills can be developed.
-  log "resolving skill symlinks..."
-  while IFS= read -r dir; do
-    [[ -d "$dir" ]] && override_mounts+=(-v "${dir}:${dir}:rw")
-  done < <(
-    find "${CLAUDE_HOME}/skills" -maxdepth 1 -type l 2>/dev/null \
-      | while IFS= read -r link; do
-          target=$(readlink "$link" 2>/dev/null) && dirname "$target"
-        done \
-      | sort -u
-  )
-else
-  log "resolving skill symlinks..."
-fi
-# Sync Claude OAuth credentials into the state dir, newer-wins. On macOS the
-# canonical source is the Keychain ("Claude Code-credentials");
-# ~/.claude/.credentials.json on macOS often holds only MCP OAuth state (no
-# claudeAiOauth block), so trusting the file by existence alone overwrites a
-# good state-dir token with garbage. The state token may also be FRESHER than
-# the Keychain — an in-box /login or token refresh from a previous run (written
-# back to the Keychain on exit, below). Access-token expiresAt is the recency
-# proxy: whichever side refreshed most recently has the larger value, so we only
-# overwrite the state token when the incoming copy is at least as new. If
-# neither source yields a token, leave the state file alone.
-#
 # Echoes a claudeAiOauth credential's expiresAt (epoch ms) from stdin, else 0.
 _cred_expiry() {
   node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const j=JSON.parse(s);process.stdout.write(String((j.claudeAiOauth&&j.claudeAiOauth.expiresAt)||0))}catch{process.stdout.write("0")}})' 2>/dev/null || printf 0
 }
-log "reading Claude credentials..."
-_state_cred="${STATE_DIR}/.credentials.json"
-_state_exp=0
-if [[ -s "$_state_cred" ]] && grep -q '"claudeAiOauth"' "$_state_cred" 2>/dev/null; then
-  _state_exp=$(_cred_expiry < "$_state_cred")
-fi
-if KEYCHAIN_CRED=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null) \
-   && [[ "$KEYCHAIN_CRED" == *claudeAiOauth* ]]; then
-  _kc_exp=$(printf '%s' "$KEYCHAIN_CRED" | _cred_expiry)
-  if [[ "${_kc_exp:-0}" -ge "${_state_exp:-0}" ]]; then
-    printf '%s\n' "$KEYCHAIN_CRED" > "$_state_cred"
-  fi
-elif [[ "${_state_exp:-0}" -eq 0 ]] && [[ -f "${CLAUDE_HOME}/.credentials.json" ]] \
-     && grep -q '"claudeAiOauth"' "${CLAUDE_HOME}/.credentials.json" 2>/dev/null; then
-  cp -f "${CLAUDE_HOME}/.credentials.json" "$_state_cred"
-fi
 
-# Prefer a long-lived OAuth token (from `claude setup-token`) over the rotating
-# subscription refresh token whenever one is available. Claude Code uses the
-# setup-token as-is and never refreshes it, so any number of concurrent boxes can
-# share it safely. The rotating refresh token can't be shared: two boxes refresh
-# it independently, the auth server sees the single-use token spent twice, and
-# revokes the whole lineage — silently logging every box out. CLAUDE_CODE_OAUTH_TOKEN
-# outranks the mounted .credentials.json OAuth block in Claude's auth precedence,
-# so the shared credential mount stays in place — both as the fallback below and
-# to keep /login propagation working — while the env token, when present, is what
-# actually authenticates.
-#
-# Source order: an already-exported CLAUDE_CODE_OAUTH_TOKEN wins; otherwise pull it
-# from a Keychain item the user creates once with the token `claude setup-token`
-# prints:
-#   security add-generic-password -U -s "Claude Code-oauth-token" -a "$USER" -w "<token>"
-# When neither yields a token we inject nothing and fall through to the rotating
-# credential above — single-box behaviour is unchanged.
-if [[ -z "$OLLAMA_MODEL" ]]; then
-  _claude_oauth_token="${CLAUDE_CODE_OAUTH_TOKEN:-}"
-  if [[ -z "$_claude_oauth_token" ]] && command -v security >/dev/null 2>&1; then
-    _claude_oauth_token=$(security find-generic-password -s "Claude Code-oauth-token" -w 2>/dev/null || true)
-  fi
-  if [[ -n "$_claude_oauth_token" ]]; then
-    env_args+=(-e "CLAUDE_CODE_OAUTH_TOKEN=${_claude_oauth_token}")
-    log "using static OAuth token (concurrency-safe; refresh disabled)"
-  fi
-fi
+# --- box_stage: everything Claude-specific, run after the cage builds its
+# generic mounts and before the (generic) colima flush. Appends to env_args /
+# override_mounts (cage globals), stages files into STATE_DIR / RELAY_DIR, and
+# sets HOST_PROJECT_SESSIONS for box_sync_back.
+box_stage() {
+  local STATE_CLAUDE_JSON="${STATE_DIR}/.claude.json"
 
-# Sync host config files into the state dir.
-# Only syncs when the host file is newer (first run, or after host update).
-# Claude Code then reads/writes the state-dir copies, keeping container state
-# independent of the host after the initial seed.
+  # claude-code: skip its npm self-install on startup.
+  env_args+=(-e "SKIP_NPM_PACKAGES_INSTALL=1")
 
-_sync_js="${TMPDIR:-/tmp}/claude-box-sync.$$.js"
-cat > "$_sync_js" <<'JSEOF'
+  # --ollama <model>: route Claude Code at an Ollama server's Anthropic-compatible
+  # API. Base URL from OLLAMA_HOST (scheme optional). ANTHROPIC_AUTH_TOKEN is a
+  # dummy Ollama ignores but Claude Code requires non-empty. Both main and
+  # small/fast models point at the same model.
+  if [[ -n "$OLLAMA_MODEL" ]]; then
+    local _ollama_url="${OLLAMA_HOST:-localhost:11434}"
+    [[ "$_ollama_url" == http://* || "$_ollama_url" == https://* ]] || _ollama_url="http://${_ollama_url}"
+    env_args+=(
+      -e "ANTHROPIC_BASE_URL=${_ollama_url}"
+      -e "ANTHROPIC_AUTH_TOKEN=ollama"
+      -e "ANTHROPIC_MODEL=${OLLAMA_MODEL}"
+      -e "ANTHROPIC_SMALL_FAST_MODEL=${OLLAMA_MODEL}"
+    )
+    log "ollama mode: ${_ollama_url} (model: ${OLLAMA_MODEL})"
+  fi
+
+  # Concatenate CLAUDE.md: global base -> parent dirs -> project (project wins).
+  # Written into the state dir so it's part of the main volume mount.
+  : > "${STATE_DIR}/CLAUDE.md"
+  [[ -f "${CLAUDE_HOME}/CLAUDE.md" ]] && cat "${CLAUDE_HOME}/CLAUDE.md" >> "${STATE_DIR}/CLAUDE.md"
+  local claude_files=() current="$PROJECT_DIR" i f
+  while [[ "$current" != "/" ]]; do
+    [[ -f "$current/CLAUDE.md" ]] && claude_files+=("$current/CLAUDE.md")
+    current="$(dirname "$current")"
+  done
+  for (( i=${#claude_files[@]}-1; i>=0; i-- )); do
+    f="${claude_files[$i]}"
+    printf '\n<!-- %s -->\n' "$f" >> "${STATE_DIR}/CLAUDE.md"
+    cat "$f" >> "${STATE_DIR}/CLAUDE.md"
+  done
+
+  # Concatenate AGENTS.md the same way into the cage relay (the entrypoint copies
+  # it to ~/.agents/AGENTS.md). Skip if the cage couldn't provide a writable relay.
+  if [[ -n "$RELAY_DIR" ]]; then
+    : > "${RELAY_DIR}/AGENTS.md"
+    [[ -f "${HOME}/.agents/AGENTS.md" ]] && cat "${HOME}/.agents/AGENTS.md" >> "${RELAY_DIR}/AGENTS.md"
+    local agents_files=()
+    current="$PROJECT_DIR"
+    while [[ "$current" != "/" ]]; do
+      [[ -f "$current/AGENTS.md" ]] && agents_files+=("$current/AGENTS.md")
+      current="$(dirname "$current")"
+    done
+    for (( i=${#agents_files[@]}-1; i>=0; i-- )); do
+      f="${agents_files[$i]}"
+      printf '\n<!-- %s -->\n' "$f" >> "${RELAY_DIR}/AGENTS.md"
+      cat "$f" >> "${RELAY_DIR}/AGENTS.md"
+    done
+  fi
+
+  # Extract gh CLI token and forward it as GH_TOKEN (cage forwards GH_TOKEN if
+  # already set; this covers the keychain-backed macOS case). Harmless duplicate
+  # of the cage's own gh fetch, kept for parity with the monolith.
+  # (No-op here: the cage already fetched GH_TOKEN before box_stage.)
+
+  # Per-project session sharing: bind-mount just this project's session dir so
+  # sessions started in claude-box are resumable from host Claude and vice versa.
+  # PROJECT_SLUG is set by the cage. HOST_PROJECT_SESSIONS is global for sync-back.
+  HOST_PROJECT_SESSIONS="${CLAUDE_HOME}/projects/${PROJECT_SLUG}"
+  mkdir -p "$HOST_PROJECT_SESSIONS"
+  mkdir -p "${STATE_DIR}/projects/${PROJECT_SLUG}"
+
+  # Surface the previous run's resume hint if the last session was dropped.
+  local _last_resume_file="${STATE_DIR}/projects/${PROJECT_SLUG}/.last-resume"
+  if [[ -s "$_last_resume_file" ]]; then
+    log "last session: $(cat "$_last_resume_file")"
+    rm -f "$_last_resume_file" 2>/dev/null || true
+  fi
+  if [[ "${DOCKER_HOST:-}" != */.colima/* ]]; then
+    override_mounts+=(-v "${HOST_PROJECT_SESSIONS}:${HOST_PROJECT_SESSIONS}")
+  fi
+
+  # Session-keyed satellite state (todos, shell env, pastes, plans, file-history).
+  local entry
+  for entry in tasks session-env shell-snapshots paste-cache plans file-history; do
+    mkdir -p "${CLAUDE_HOME}/${entry}"
+    if [[ "${DOCKER_HOST:-}" != */.colima/* ]]; then
+      override_mounts+=(-v "${CLAUDE_HOME}/${entry}:${CLAUDE_HOME}/${entry}")
+    fi
+  done
+
+  # On non-Colima runtimes, overlay-mount host ~/.claude entries on top of the
+  # state dir so the container reflects the host's current setup. On Colima these
+  # mounts silently fail (virtiofs can't see host dirs), so sync into the state
+  # dir instead (below), before the cage's flush.
+  if [[ "${DOCKER_HOST:-}" != */.colima/* ]]; then
+    for entry in plugins skills hooks .mcp.json; do
+      if [[ -e "${CLAUDE_HOME}/${entry}" ]]; then
+        if [[ -d "${CLAUDE_HOME}/${entry}" ]]; then mkdir -p "${STATE_DIR}/${entry}"; else touch "${STATE_DIR}/${entry}"; fi
+        override_mounts+=(-v "${CLAUDE_HOME}/${entry}:${CLAUDE_HOME}/${entry}:rw")
+      fi
+    done
+    # Symlinked skills point outside ~/.claude; mount their target parent dirs rw
+    # so those paths resolve inside the container.
+    log "resolving skill symlinks..."
+    local dir target
+    while IFS= read -r dir; do
+      [[ -d "$dir" ]] && override_mounts+=(-v "${dir}:${dir}:rw")
+    done < <(
+      find "${CLAUDE_HOME}/skills" -maxdepth 1 -type l 2>/dev/null \
+        | while IFS= read -r link; do target=$(readlink "$link" 2>/dev/null) && dirname "$target"; done \
+        | sort -u
+    )
+  else
+    log "resolving skill symlinks..."
+  fi
+
+  # Sync Claude OAuth credentials into the state dir, newer-wins by expiresAt. On
+  # macOS the canonical source is the Keychain ("Claude Code-credentials");
+  # ~/.claude/.credentials.json often holds only MCP OAuth state, so trusting the
+  # file by existence would overwrite a good state token with garbage.
+  log "reading Claude credentials..."
+  local _state_cred="${STATE_DIR}/.credentials.json" _state_exp=0 KEYCHAIN_CRED _kc_exp
+  if [[ -s "$_state_cred" ]] && grep -q '"claudeAiOauth"' "$_state_cred" 2>/dev/null; then
+    _state_exp=$(_cred_expiry < "$_state_cred")
+  fi
+  if KEYCHAIN_CRED=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null) \
+     && [[ "$KEYCHAIN_CRED" == *claudeAiOauth* ]]; then
+    _kc_exp=$(printf '%s' "$KEYCHAIN_CRED" | _cred_expiry)
+    if [[ "${_kc_exp:-0}" -ge "${_state_exp:-0}" ]]; then
+      printf '%s\n' "$KEYCHAIN_CRED" > "$_state_cred"
+    fi
+  elif [[ "${_state_exp:-0}" -eq 0 ]] && [[ -f "${CLAUDE_HOME}/.credentials.json" ]] \
+       && grep -q '"claudeAiOauth"' "${CLAUDE_HOME}/.credentials.json" 2>/dev/null; then
+    cp -f "${CLAUDE_HOME}/.credentials.json" "$_state_cred"
+  fi
+
+  # Prefer a long-lived OAuth token (claude setup-token) over the rotating
+  # subscription refresh token so concurrent boxes don't revoke each other's
+  # lineage. Skipped in ollama mode. Env token outranks the mounted credential.
+  if [[ -z "$OLLAMA_MODEL" ]]; then
+    local _claude_oauth_token="${CLAUDE_CODE_OAUTH_TOKEN:-}"
+    if [[ -z "$_claude_oauth_token" ]] && command -v security >/dev/null 2>&1; then
+      _claude_oauth_token=$(security find-generic-password -s "Claude Code-oauth-token" -w 2>/dev/null || true)
+    fi
+    if [[ -n "$_claude_oauth_token" ]]; then
+      env_args+=(-e "CLAUDE_CODE_OAUTH_TOKEN=${_claude_oauth_token}")
+      log "using static OAuth token (concurrency-safe; refresh disabled)"
+    fi
+  fi
+
+  # Settings surgery: seed settings.json / .claude.json into the state dir (host
+  # newer-wins), stripping sandbox/hooks, rewriting the macOS bun path to the
+  # container path, forcing the claude-box theme, and pre-accepting the bypass
+  # dialog. statusline mode refreshes the HUD every launch.
+  local _sync_js="${TMPDIR:-/tmp}/claude-box-sync.$$.js"
+  cat > "$_sync_js" <<'JSEOF'
 const fs = require('fs');
 const [,, mode, src, dst] = process.argv;
 const s = JSON.parse(fs.readFileSync(src, 'utf8'));
 if (mode === 'passthrough') {
-  // Pre-accept the bypass permissions dialog so --dangerously-skip-permissions
-  // doesn't prompt every run.
   s.bypassPermissionsModeAccepted = true;
 }
 if (mode === 'settings') {
   delete s.sandbox;
   delete s.hooks;
-  // Rewrite macOS bun path to container path so plugins like claude-hud work.
   if (s.statusLine && s.statusLine.command) {
     s.statusLine.command = s.statusLine.command.replace(/\/opt\/homebrew\/bin\/bun/g, '/usr/local/bin/bun');
   }
-  // Use the claude-box theme so the container is visually distinct from host Claude.
   s.theme = 'custom:claude-box';
 }
 if (mode === 'statusline') {
-  // Refresh ONLY the host's statusLine (the HUD) + theme into the existing state
-  // copy, bun path rewritten — merging into, not replacing, the box's settings.
-  // Runs every launch (bypassing the -nt seed guard) so a host statusLine still
-  // reaches the box after Claude has rewritten the box's settings.json and made
-  // it "newer" than the host. Mirrors the host: sets it when present, removes it
-  // when absent. Bails without writing if the state file is unreadable, so a
-  // transient parse error can't nuke the box's settings.
   let cur;
   try { cur = JSON.parse(fs.readFileSync(dst, 'utf8')); } catch { process.exit(0); }
   if (s.statusLine) {
@@ -998,181 +265,120 @@ if (mode === 'statusline') {
 fs.writeFileSync(dst, JSON.stringify(s, null, 2));
 JSEOF
 
-HOST_SETTINGS="${CLAUDE_HOME}/settings.json"
-STATE_SETTINGS="${STATE_DIR}/settings.json"
-if [[ -f "$HOST_SETTINGS" ]] && { [[ ! -f "$STATE_SETTINGS" ]] || [[ "$HOST_SETTINGS" -nt "$STATE_SETTINGS" ]]; }; then
-  node "$_sync_js" settings "$HOST_SETTINGS" "$STATE_SETTINGS"
-fi
-
-# The HUD (statusLine) is host-derived presentation config, so refresh it from
-# the host on EVERY launch — not just on the -nt seed above. Claude rewrites the
-# box's settings.json during a session (theme/model/config), making the state
-# copy permanently "newer" than the host; without this, a host statusLine added
-# or changed afterwards never reaches the box and the HUD silently disappears.
-if [[ -f "$HOST_SETTINGS" && -f "$STATE_SETTINGS" ]]; then
-  node "$_sync_js" statusline "$HOST_SETTINGS" "$STATE_SETTINGS"
-fi
-
-HOST_CLAUDE_JSON="${HOME}/.claude.json"
-STATE_CLAUDE_JSON="${STATE_DIR}/.claude.json"
-if [[ -f "$HOST_CLAUDE_JSON" ]] && { [[ ! -f "$STATE_CLAUDE_JSON" ]] || [[ "$HOST_CLAUDE_JSON" -nt "$STATE_CLAUDE_JSON" ]]; }; then
-  node "$_sync_js" passthrough "$HOST_CLAUDE_JSON" "$STATE_CLAUDE_JSON"
-fi
-
-rm -f "$_sync_js"
-
-# Ensure all bind-mount source files exist as actual files. Docker auto-creates
-# nonexistent sources as root-owned directories, which persists in the state dir
-# and breaks subsequent runs (especially on Colima).
-for _f in "$STATE_CLAUDE_JSON" "${STATE_DIR}/CLAUDE.md" "${STATE_DIR}/settings.json" \
-          "${STATE_DIR}/.credentials.json"; do
-  [[ -d "$_f" ]] && rm -rf "$_f"
-  [[ ! -f "$_f" ]] && touch "$_f"
-done
-
-# Colima's virtiofs cache may not expose freshly-written host files to the VM
-# in time for bind mounts. Flush volatile state files through Docker's I/O path
-# by tar-piping them into a lightweight container that writes to the same volume,
-# warming the VM's filesystem cache. Other runtimes skip this — they share the
-# full host filesystem without caching issues.
-if [[ "${DOCKER_HOST:-}" == */.colima/* ]]; then
-  # Sync host ~/.claude entries (plugins, skills, hooks, .mcp.json) into the
-  # state dir. Overlay mounts from the host fail on Colima (virtiofs can't see
-  # host-written dirs), so everything must be in the state dir volume.
-  log "syncing host config for colima..."
-  for _sync_entry in plugins skills hooks; do
-    if [[ -d "${CLAUDE_HOME}/${_sync_entry}" ]]; then
-      mkdir -p "${STATE_DIR}/${_sync_entry}"
-      rsync -aL --delete "${CLAUDE_HOME}/${_sync_entry}/" "${STATE_DIR}/${_sync_entry}/" 2>/dev/null || \
-        cp -rfL "${CLAUDE_HOME}/${_sync_entry}/." "${STATE_DIR}/${_sync_entry}/" 2>/dev/null || true
-    fi
-  done
-  [[ -f "${CLAUDE_HOME}/.mcp.json" ]] && cp -f "${CLAUDE_HOME}/.mcp.json" "${STATE_DIR}/.mcp.json" 2>/dev/null || true
-
-  # Inbound session seeding (host -> state). The live override mounts for the
-  # project sessions dir and the satellite-state dirs are skipped on Colima, and
-  # the post-exit sync only copies state -> host. Without this, a session that
-  # exists on the host — created by host Claude, by a prior box run, or copied
-  # in by hand — is invisible inside the box. Seed newer-wins (no --delete, so
-  # it unions rather than mirrors) so an in-box-newer session isn't clobbered by
-  # a stale host copy; the flush below carries the result into the VM.
-  log "seeding host sessions for colima..."
-  if [[ -d "$HOST_PROJECT_SESSIONS" ]]; then
-    rsync -au "${HOST_PROJECT_SESSIONS}/" "${STATE_DIR}/projects/${PROJECT_SLUG}/" 2>/dev/null || \
-      cp -ru "${HOST_PROJECT_SESSIONS}/." "${STATE_DIR}/projects/${PROJECT_SLUG}/" 2>/dev/null || true
+  local HOST_SETTINGS="${CLAUDE_HOME}/settings.json" STATE_SETTINGS="${STATE_DIR}/settings.json"
+  if [[ -f "$HOST_SETTINGS" ]] && { [[ ! -f "$STATE_SETTINGS" ]] || [[ "$HOST_SETTINGS" -nt "$STATE_SETTINGS" ]]; }; then
+    node "$_sync_js" settings "$HOST_SETTINGS" "$STATE_SETTINGS"
   fi
-  for _seed_sat in tasks session-env shell-snapshots paste-cache plans file-history; do
-    if [[ -d "${CLAUDE_HOME}/${_seed_sat}" ]]; then
-      mkdir -p "${STATE_DIR}/${_seed_sat}"
-      rsync -au "${CLAUDE_HOME}/${_seed_sat}/" "${STATE_DIR}/${_seed_sat}/" 2>/dev/null || \
-        cp -ru "${CLAUDE_HOME}/${_seed_sat}/." "${STATE_DIR}/${_seed_sat}/" 2>/dev/null || true
-    fi
+  if [[ -f "$HOST_SETTINGS" && -f "$STATE_SETTINGS" ]]; then
+    node "$_sync_js" statusline "$HOST_SETTINGS" "$STATE_SETTINGS"
+  fi
+  local HOST_CLAUDE_JSON="${HOME}/.claude.json"
+  if [[ -f "$HOST_CLAUDE_JSON" ]] && { [[ ! -f "$STATE_CLAUDE_JSON" ]] || [[ "$HOST_CLAUDE_JSON" -nt "$STATE_CLAUDE_JSON" ]]; }; then
+    node "$_sync_js" passthrough "$HOST_CLAUDE_JSON" "$STATE_CLAUDE_JSON"
+  fi
+  rm -f "$_sync_js"
+
+  # Ensure all bind-mount source files exist as actual files (Docker auto-creates
+  # missing sources as root-owned dirs, which persists and breaks later runs).
+  local _f
+  for _f in "$STATE_CLAUDE_JSON" "${STATE_DIR}/CLAUDE.md" "${STATE_DIR}/settings.json" \
+            "${STATE_DIR}/.credentials.json"; do
+    [[ -d "$_f" ]] && rm -rf "$_f"
+    [[ ! -f "$_f" ]] && touch "$_f"
   done
 
-  # Flush the entire state dir through Docker I/O so the VM sees everything —
-  # both the files we just synced and the volatile files (credentials, settings).
-  log "flushing state for colima..."
-  tar --no-xattrs -cf - -C "${STATE_DIR}" . 2>/dev/null \
-    | docker run --rm -i --entrypoint tar -v "${STATE_DIR}:/_state" "${IMAGE}" --no-same-owner -xf - -C /_state 2>/dev/null || true
-fi
+  # On Colima, host overlay mounts fail, so sync host ~/.claude config + seed
+  # sessions into the state dir here; the cage's flush (after box_stage) carries
+  # it all into the VM.
+  if [[ "${DOCKER_HOST:-}" == */.colima/* ]]; then
+    log "syncing host config for colima..."
+    local _sync_entry
+    for _sync_entry in plugins skills hooks; do
+      if [[ -d "${CLAUDE_HOME}/${_sync_entry}" ]]; then
+        mkdir -p "${STATE_DIR}/${_sync_entry}"
+        rsync -aL --delete "${CLAUDE_HOME}/${_sync_entry}/" "${STATE_DIR}/${_sync_entry}/" 2>/dev/null || \
+          cp -rfL "${CLAUDE_HOME}/${_sync_entry}/." "${STATE_DIR}/${_sync_entry}/" 2>/dev/null || true
+      fi
+    done
+    [[ -f "${CLAUDE_HOME}/.mcp.json" ]] && cp -f "${CLAUDE_HOME}/.mcp.json" "${STATE_DIR}/.mcp.json" 2>/dev/null || true
 
-# Mount .claude.json (main state) into the container at the home dir level
-override_mounts+=(-v "${STATE_CLAUDE_JSON}:${HOME}/.claude.json")
+    log "seeding host sessions for colima..."
+    if [[ -d "$HOST_PROJECT_SESSIONS" ]]; then
+      rsync -au "${HOST_PROJECT_SESSIONS}/" "${STATE_DIR}/projects/${PROJECT_SLUG}/" 2>/dev/null || \
+        cp -ru "${HOST_PROJECT_SESSIONS}/." "${STATE_DIR}/projects/${PROJECT_SLUG}/" 2>/dev/null || true
+    fi
+    local _seed_sat
+    for _seed_sat in tasks session-env shell-snapshots paste-cache plans file-history; do
+      if [[ -d "${CLAUDE_HOME}/${_seed_sat}" ]]; then
+        mkdir -p "${STATE_DIR}/${_seed_sat}"
+        rsync -au "${CLAUDE_HOME}/${_seed_sat}/" "${STATE_DIR}/${_seed_sat}/" 2>/dev/null || \
+          cp -ru "${CLAUDE_HOME}/${_seed_sat}/." "${STATE_DIR}/${_seed_sat}/" 2>/dev/null || true
+      fi
+    done
+  fi
 
-# Set the terminal tab/window title to the project name so it's obvious which
-# box this tab belongs to (otherwise it just shows "bash" or "docker"). OSC 0
-# sets both icon name and window title — supported by iTerm2, Terminal.app,
-# gnome-terminal, kitty, alacritty, tmux, etc. Gated on stderr being a tty so
-# piped/non-interactive runs don't leak escape codes. The parent shell's
-# prompt hook normally restores its own title after we exit.
-if [[ -t 2 ]]; then
-  printf '\e]0;claude-box: %s\a' "$(basename "$PROJECT_DIR")" >&2
-fi
+  # Mount .claude.json (main state) at the home dir level.
+  override_mounts+=(-v "${STATE_CLAUDE_JSON}:${HOME}/.claude.json")
+}
 
-# Compose docker's -i/-t independently from the actual fd shapes.
-#
-# -t (allocate a PTY): only when BOTH stdout and stderr are real terminals.
-# Claude Code's Ink TUI needs a PTY on stdout for color + layout, but a PTY also
-# applies CRLF translation and merges the container's stderr into stdout. So if
-# stdout alone is redirected (`claude-box -p … > out.txt`), gating on any-of-
-# three would still allocate a PTY and corrupt the capture with \r\n and stray
-# [entrypoint] lines. Requiring both stdout and stderr to be ttys means a PTY is
-# used only for genuinely interactive runs, and any redirection drops it.
-#
-# -i (attach stdin): only when something is actually connected to stdin — a
-# terminal, a pipe, or a redirected file. Passing -i unconditionally makes a
-# supervisor that launches us with stdin at /dev/null hand Claude an immediate
-# EOF (interactive Claude then exits at once); omitting -i there leaves stdin
-# unattached, which is correct for a no-stdin invocation.
-TTY_FLAGS=()
-if [[ -t 0 || -p /dev/stdin || -f /dev/stdin || -S /dev/stdin ]]; then
-  TTY_FLAGS+=(-i)
-fi
-if [[ -t 1 && -t 2 ]]; then
-  TTY_FLAGS+=(-t)
-fi
+# --- box_sync_back: flush sessions, credentials, and satellite state back to the
+# host, write a refreshed token back to the Keychain, and print the resume hint.
+# Runs from the cage's EXIT trap after the container has stopped; on colima the
+# cage created _CID over the state volume for docker cp.
+box_sync_back() {
+  local _state_proj="${STATE_DIR}/projects/${PROJECT_SLUG}"
 
-# Mount order matters: state volume first, then specific overrides shadow it
-# for the paths that need to reflect the host (settings, skills, CLAUDE.md).
-# Entrypoint runs as root, creates a hostuser for HOST_UID, then drops to it.
-log "starting container..."
-_LAUNCHED=1
-_rc=0
+  if [[ -n "$_CID" ]]; then
+    # Colima: copy out through Docker's I/O path (the host can't see it directly).
+    log "syncing state back from colima..."
+    docker cp "${_CID}:/_state/projects/${PROJECT_SLUG}/." "${_state_proj}/" 2>/dev/null || true
+    docker cp "${_CID}:/_state/.claude.json" "${STATE_DIR}/.claude.json" 2>/dev/null || true
+    docker cp "${_CID}:/_state/.credentials.json" "${STATE_DIR}/.credentials.json" 2>/dev/null || true
+    local _sat
+    for _sat in tasks session-env shell-snapshots paste-cache plans file-history; do
+      docker cp "${_CID}:/_state/${_sat}/." "${STATE_DIR}/${_sat}/" 2>/dev/null || true
+    done
+  fi
 
-# Publish the box's name for a headless caller to address (docker stop/exec).
-# Written HERE — just before the container exists and inside the EXIT-trap
-# coverage (trap set above with sync_back/cleanup) — so the file's lifetime
-# matches the box's: cleanup() removes it on exit, and the container is --rm so a
-# post-exit handle would be dead anyway. A caller that only passes --name-file
-# polls for this file to appear, then reads the name.
-if [[ -n "$NAME_FILE" ]]; then
-  printf '%s\n' "$CONTAINER_NAME" > "$NAME_FILE" \
-    || warn "--name-file: could not write ${NAME_FILE}"
-fi
+  # Write an in-box token refresh back to the macOS Keychain, newer-wins by
+  # expiresAt. Only updates an existing item, only for a real claudeAiOauth token.
+  if command -v security >/dev/null 2>&1 \
+     && [[ -s "${STATE_DIR}/.credentials.json" ]] \
+     && grep -q '"claudeAiOauth"' "${STATE_DIR}/.credentials.json" 2>/dev/null; then
+    local _state_exp _kc_exp=0 _kc_now _kc_acct
+    _state_exp=$(_cred_expiry < "${STATE_DIR}/.credentials.json")
+    if _kc_now=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null) \
+       && [[ "$_kc_now" == *claudeAiOauth* ]]; then
+      _kc_exp=$(printf '%s' "$_kc_now" | _cred_expiry)
+    fi
+    _kc_acct=$(security find-generic-password -s "Claude Code-credentials" 2>/dev/null \
+      | sed -n 's/^[[:space:]]*"acct"<blob>="\(.*\)"$/\1/p')
+    if [[ -n "$_kc_acct" && "${_state_exp:-0}" -gt "${_kc_exp:-0}" ]]; then
+      security add-generic-password -U -s "Claude Code-credentials" -a "$_kc_acct" \
+        -w "$(cat "${STATE_DIR}/.credentials.json")" 2>/dev/null \
+        && log "synced refreshed Claude token back to Keychain" || true
+    fi
+  fi
 
-docker run --rm "${TTY_FLAGS[@]}" \
-  --name "$CONTAINER_NAME" \
-  -e "HOST_UID=$(id -u)" \
-  -e "HOST_GID=$(id -g)" \
-  -e "HOME=${HOME}" \
-  -e "SKIP_NPM_PACKAGES_INSTALL=1" \
-  -e "GIT_CONFIG_COUNT=3" \
-  -e "GIT_CONFIG_KEY_0=safe.directory" \
-  -e "GIT_CONFIG_VALUE_0=*" \
-  -e "GIT_CONFIG_KEY_1=url.https://github.com/.insteadOf" \
-  -e "GIT_CONFIG_VALUE_1=git@github.com:" \
-  -e "GIT_CONFIG_KEY_2=credential.helper" \
-  -e "GIT_CONFIG_VALUE_2=!gh auth git-credential" \
-  -v "${PROJECT_DIR}:${PROJECT_DIR}" \
-  -v "${STATE_DIR}:${CLAUDE_HOME}" \
-  ${override_mounts[@]+"${override_mounts[@]}"} \
-  ${engine_args[@]+"${engine_args[@]}"} \
-  ${env_args[@]+"${env_args[@]}"} \
-  -w "${PROJECT_DIR}" \
-  "$IMAGE" \
-  --dangerously-skip-permissions ${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"} || _rc=$?
+  # Copy sessions to the host's Claude project dir for cross-tool resumability,
+  # preserving mtimes so the resume hint picks the just-closed session correctly.
+  cp -pf "${_state_proj}/"*.jsonl "$HOST_PROJECT_SESSIONS/" 2>/dev/null
+  cp -prf "${_state_proj}/"*/ "$HOST_PROJECT_SESSIONS/" 2>/dev/null
 
-# The session/credential flush + resume hint run from the EXIT trap (sync_back,
-# defined above), so they fire on a dropped session too — not just a clean exit.
-#
-# Map docker run's status to the launcher's exit contract (see header). The
-# harness's own codes pass through verbatim (0, 1–124 and signal deaths 128+);
-# docker's container-lifecycle band becomes a distinguishable launcher fault
-# with a machine-readable reason on stderr. Image-missing was already caught
-# pre-run as 125, so a 125 HERE means the container failed to start with the
-# image present — an engine/runtime rejection (bad posture, denied privileged /
-# security-opt, missing runtime). 126/127 mean docker could not exec the harness
-# (claude not executable / not found). The rare harness that itself exits in
-# 125–127 is misattributed by the code alone — the fault= line, present only on
-# a real launcher fault, is what actually disambiguates.
-case "$_rc" in
-  125)
-    fault engine-start-failed "docker could not create/start the container (check --engine posture and host runtime)"
-    _rc=126
-    ;;
-  126|127)
-    fault harness-not-executable "the container could not exec the harness (claude not found or not executable)"
-    _rc=127
-    ;;
-esac
-exit "$_rc"
+  # Resume hint: newest transcript by mtime across the state dir and host dir,
+  # skipping agent-*.jsonl subagent sidechains.
+  local _latest="" f _id _resume_cmd
+  for f in "${_state_proj}/"*.jsonl "${HOST_PROJECT_SESSIONS}/"*.jsonl; do
+    [[ -f "$f" ]] || continue
+    case "${f##*/}" in agent-*) continue ;; esac
+    [[ -z "$_latest" || "$f" -nt "$_latest" ]] && _latest="$f"
+  done
+  if [[ -n "$_latest" ]]; then
+    _id=$(basename "$_latest" .jsonl)
+    _resume_cmd="claude-box -r ${_id}"
+    printf '[claude-box] to resume: %s\n' "$_resume_cmd" >&2
+    printf '%s\n' "$_resume_cmd" > "${_state_proj}/.last-resume" 2>/dev/null || true
+  fi
+}
+
+cage_run "$@"

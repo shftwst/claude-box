@@ -1,11 +1,16 @@
 FROM node:22-bookworm-slim
 
-# System deps + GitHub CLI + a full nested container engine (ADR-0041
-# decision 3): the cage gets its OWN dockerd — rootless by default, rootful
-# under sysbox / privileged dind — never a mounted host socket. docker-ce
-# brings dockerd; docker-ce-rootless-extras brings dockerd-rootless.sh +
-# rootlesskit; uidmap/slirp4netns/fuse-overlayfs/iproute2/iptables are the
-# rootless engine's userns, networking, and storage tooling.
+# cage-base — the payload-free box: host-isolation tooling and a full nested
+# container engine (ADR-0041 decision 3), with NO agent harness baked in. A
+# payload image (claude-box, codex-box) does `FROM cage-base` and adds its own
+# harness. Nothing Claude-specific lives here: no claude-code, no ugrep
+# grep-shadow, no bun — those moved to the Claude payload layer.
+#
+# The cage gets its OWN dockerd — rootless by default, rootful under sysbox /
+# privileged dind — never a mounted host socket. docker-ce brings dockerd;
+# docker-ce-rootless-extras brings dockerd-rootless.sh + rootlesskit;
+# uidmap/slirp4netns/fuse-overlayfs/iproute2/iptables are the rootless engine's
+# userns, networking, and storage tooling.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git curl ca-certificates gnupg unzip jq openssh-client socat \
     python3 python3-pip python3-venv \
@@ -26,7 +31,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Chromium runtime libs so Playwright (installed per-project in venvs) can launch
 # its bundled browser without needing root at runtime. Browser binary itself is
-# not baked in — `playwright install chromium` fetches it on demand.
+# not baked in — `playwright install chromium` fetches it on demand. Generic
+# capability, not Claude's, so it belongs in the cage.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libnss3 libnspr4 libdbus-1-3 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
     libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2 \
@@ -34,7 +40,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # AWS CLI v2 — official bundled installer (arch-aware). Netlify CLI ships via
-# npm below; flyctl via its official install script.
+# npm below; flyctl via its official install script. Generic deploy CLIs.
 RUN case "$(dpkg --print-architecture)" in \
         amd64) awscli_arch=x86_64 ;; \
         arm64) awscli_arch=aarch64 ;; \
@@ -58,9 +64,6 @@ RUN npm install -g netlify-cli wrangler \
 # the official Astral image so we don't curl-pipe-sh.
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
 
-# Bun (required for Claude Code plugins — claude-hud, etc.)
-RUN curl -fsSL https://bun.sh/install | BUN_INSTALL=/usr/local bash
-
 # Yarn Berry (for Node.js projects using Yarn 4)
 RUN corepack enable && corepack prepare yarn@4.13.0 --activate
 
@@ -71,29 +74,8 @@ RUN curl -fsSL "https://github.com/tianon/gosu/releases/download/1.17/gosu-$(dpk
     && chmod +x /usr/local/bin/gosu \
     && gosu nobody true
 
-# ugrep + shadow grep with it. Claude Code on the host transparently redirects
-# `grep` to ugrep (via a shell function) so patterns can use ugrep extensions
-# like `\t` in -E regex. Subprocesses spawned by Claude Code (e.g. statusLine
-# commands from plugins like claude-hud) don't inherit that shell function, so
-# in the container we install ugrep system-wide and put a `grep` symlink on
-# /usr/local/bin (which precedes /usr/bin on PATH) — anything resolving `grep`
-# via PATH gets ugrep, while scripts that hardcode /usr/bin/grep still hit the
-# stock GNU grep.
-RUN apt-get update && apt-get install -y --no-install-recommends ugrep \
-    && ln -sf /usr/bin/ugrep /usr/local/bin/grep \
-    && rm -rf /var/lib/apt/lists/*
-
-# Claude Code
-RUN npm install -g @anthropic-ai/claude-code \
-    && npm cache clean --force
-
-COPY entrypoint.sh /usr/local/bin/claude-box-entrypoint.sh
+COPY entrypoint-cage.sh /usr/local/bin/cage-entrypoint.sh
 COPY userns-probe.sh /usr/local/bin/claude-box-userns-probe
-RUN chmod +x /usr/local/bin/claude-box-entrypoint.sh /usr/local/bin/claude-box-userns-probe
+RUN chmod +x /usr/local/bin/cage-entrypoint.sh /usr/local/bin/claude-box-userns-probe
 
-# Bake the claude-box theme into the image so it's available regardless of
-# host mounts or virtiofs cache state. The entrypoint copies it into the
-# user's themes dir at startup.
-COPY claude-box-theme.json /usr/local/share/claude-box-theme.json
-
-ENTRYPOINT ["/usr/local/bin/claude-box-entrypoint.sh"]
+ENTRYPOINT ["/usr/local/bin/cage-entrypoint.sh"]

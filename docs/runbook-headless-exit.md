@@ -14,8 +14,8 @@ acceptance criteria.
   ```sh
   mkdir -p /tmp/cbtest && cd /tmp/cbtest && git init -q
   ```
-- The **first run rebuilds the image** (entrypoint.sh changed → mtime triggers a
-  rebuild). Warm it once and ignore its output:
+- The **first run builds images** (`cage-base`, then the `claude-box` payload
+  image). Warm them once and ignore the output:
   ```sh
   claude-box -- --version >/dev/null 2>&1 || true
   ```
@@ -25,14 +25,14 @@ acceptance criteria.
 Two test hooks (both forwarded into the box by this branch):
 - `CLAUDE_BOX_EXEC=1 claude-box -- <cmd…>` runs `<cmd…>` as the in-box harness
   instead of `claude`, so you can make the harness exit with any status.
-- `CLAUDE_BOX_DEBUG=1` opts into the entrypoint's state dump.
+- `CLAUDE_BOX_DEBUG=1` opts into the cage's state dump.
 
 ---
 
 ## Part 0 — Static checks (no docker)
 
 ```sh
-bash -n claude-box && bash -n entrypoint.sh && echo "parse OK"
+bash -n claude-box && bash -n libcage.sh && bash -n entrypoint-cage.sh && echo "parse OK"
 ```
 
 Exit-code mapping, in isolation (this is the authoritative check for the 127
@@ -90,7 +90,7 @@ Break the build in a throwaway copy of the repo so the real one is untouched
 ```sh
 REPO=~/src/claude-box            # adjust
 cp -r "$REPO" /tmp/cb-broken
-printf '\nRUN exit 1\n' >> /tmp/cb-broken/Dockerfile
+printf '\nRUN exit 1\n' >> /tmp/cb-broken/Dockerfile.claude
 docker rmi -f claude-box >/dev/null 2>&1 || true
 
 cd /tmp/cbtest
@@ -155,7 +155,7 @@ the tty-gated `log()` would have dropped it; `fault()` does not.
 
 ## Part 3 — Streams & TTY
 
-### 3a. Redirected stdout is clean: no CRLF, no `[entrypoint]`, nothing from stderr
+### 3a. Redirected stdout is clean: no CRLF, no `[cage]`, nothing from stderr
 
 Run from an **interactive terminal** (stdout → file, stderr → terminal):
 
@@ -165,7 +165,7 @@ CLAUDE_BOX_EXEC=1 claude-box -- bash -c 'printf "hello\n"' > out.txt
 
 od -c out.txt | head -1                       # expect: h e l l o \n   (no \r)
 printf 'CR count:        '; grep -c $'\r' out.txt          # expect 0
-printf 'entrypoint lines: '; grep -c '\[entrypoint\]' out.txt   # expect 0
+printf 'cage log lines:  '; grep -c '\[cage\]' out.txt   # expect 0
 printf 'line count:      '; wc -l < out.txt   # expect 1
 ```
 
@@ -173,10 +173,10 @@ Real-harness variant (needs auth):
 
 ```sh
 claude-box -p 'reply with exactly: hello' > out2.txt
-grep -c $'\r' out2.txt ; grep -c '\[entrypoint\]' out2.txt   # both 0
+grep -c $'\r' out2.txt ; grep -c '\[cage\]' out2.txt   # both 0
 ```
 
-PASS: `out.txt` is exactly `hello\n`; no `\r`, no `[entrypoint]` lines, no stderr
+PASS: `out.txt` is exactly `hello\n`; no `\r`, no `[cage]` lines, no stderr
 content leaked into the file.
 
 ### 3b. `-i` only when stdin is connected
@@ -205,12 +205,13 @@ cd /tmp/cbtest
 CLAUDE_BOX_EXEC=1 claude-box -- true </dev/null 2>off.txt
 CLAUDE_BOX_DEBUG=1 CLAUDE_BOX_EXEC=1 claude-box -- true </dev/null 2>on.txt
 
-printf 'default dump lines: '; grep -c '.credentials.json:' off.txt   # expect 0
-printf 'debug dump lines:   '; grep -c '.credentials.json:' on.txt    # expect >=1
+printf 'default dump lines: '; grep -c 'state mount' off.txt   # expect 0
+printf 'debug dump lines:   '; grep -c 'state mount' on.txt    # expect >=1
 ```
 
-PASS: no credential/`.claude.json` dump by default; present under
-`CLAUDE_BOX_DEBUG=1`.
+PASS: no dump by default; the `[cage] state mount (…)` listing appears only under
+`CLAUDE_BOX_DEBUG=1`. The cage dump lists the state mount and, unlike the old
+monolith, never cats credential file contents.
 
 ---
 
@@ -302,7 +303,7 @@ with `[claude-box] --name: invalid container name` and starts nothing.
 | 2b | engine start failed | exit 126 + `fault=engine-start-failed` | PASS
 | 2c | harness not executable | mapping check `126/127→127`; live `fault=harness-not-executable` |
 | 2d | fault line, fully headless | line present in captured stderr |
-| 3a | redirected stdout | no `\r`, no `[entrypoint]`, no stderr leak |
+| 3a | redirected stdout | no `\r`, no `[cage]`, no stderr leak |
 | 3b | `-i` gating | pipe round-trips; no-stdin run doesn't hang (≠124) |
 | 3c | debug dump | absent by default; present with `CLAUDE_BOX_DEBUG=1` |
 | 4 | SIGINT headless | launcher exits; no live/lingering container |

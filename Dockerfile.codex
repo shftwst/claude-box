@@ -1,0 +1,9 @@
+FROM cage-base
+
+# codex-box payload: the OpenAI Codex CLI on top of the payload-free cage.
+# Nothing else is added — the cage already carries git, gh, the nested engine,
+# and the generic dev tooling. Auth is a persisted ~/.codex login synced by the
+# launcher; the harness runs with --dangerously-bypass-approvals-and-sandbox
+# because the cage is the isolation boundary.
+RUN npm install -g @openai/codex \
+    && npm cache clean --force
