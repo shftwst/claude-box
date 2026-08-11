@@ -1,10 +1,10 @@
 # claude-box
 
-A Docker sandbox for Claude Code that feels native. Your global skills, plugins, MCP servers, git config, and persistent Claude sessions all carry over — with per-project overrides via a simple `.env.claude-box` file.
+A Docker sandbox for Claude Code / Codex that feels native. Your global skills, plugins, MCP servers, git config, and persistent sessions all carry over — with per-project overrides via a simple `.env.claude-box` file.
 
 ## Why
 
-Plenty of options already run Claude Code in a sandbox — Docker's built-in sandbox mode, generic containers, dev containers. The harder problem is making that sandbox feel like running Claude natively: every `~/.claude/` skill resolved (including symlinks pointing into other repos), MCP servers reachable, `.gitconfig` and SSH agent forwarded, macOS Keychain credentials still valid, sessions resumable across container and host.
+Plenty of options already run Claude Code / Codex in a sandbox — Docker's built-in sandbox mode, generic containers, dev containers. The harder problem is making that sandbox feel like running Claude natively: every `~/.claude/` skill resolved (including symlinks pointing into other repos), MCP servers reachable, `.gitconfig` and SSH agent forwarded, macOS Keychain credentials still valid, sessions resumable across container and host.
 
 claude-box bridges that gap. It wires up the bind-mounts, credential extraction, and env forwarding so you get the `--dangerously-skip-permissions` bypass without giving up the native ergonomics. And `.env.claude-box` lets each project layer its own forwarded env vars and extra mounts on top — no global config edits, no remembering which API key belongs to which workspace.
 
