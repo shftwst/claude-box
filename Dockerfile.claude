@@ -18,8 +18,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends ugrep \
 # Bun (required for Claude Code plugins — claude-hud, etc.)
 RUN curl -fsSL https://bun.sh/install | BUN_INSTALL=/usr/local bash
 
-# Claude Code
-RUN npm install -g @anthropic-ai/claude-code \
+# Claude Code (track the current npm release when the image is built)
+RUN npm install -g @anthropic-ai/claude-code@latest \
     && npm cache clean --force
 
 # Bake the claude-box theme into the image so it's available regardless of host

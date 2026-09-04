@@ -5,5 +5,5 @@ FROM cage-base
 # and the generic dev tooling. Auth is a persisted ~/.codex login synced by the
 # launcher; the harness runs with --dangerously-bypass-approvals-and-sandbox
 # because the cage is the isolation boundary.
-RUN npm install -g @openai/codex \
+RUN npm install -g @openai/codex@latest \
     && npm cache clean --force
