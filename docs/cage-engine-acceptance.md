@@ -2,8 +2,9 @@
 
 Proves the extraction: the cage (`libcage.sh` + `Dockerfile.cage` +
 `entrypoint-cage.sh`) owns host isolation and the nested engine exactly once,
-carries no agent harness, and runs an arbitrary payload. Two payloads,
-`claude-box` and `codex-box`, compose that one cage without duplicating it.
+carries no agent harness, and runs an arbitrary payload. Three payloads,
+`claude-box`, `codex-box`, and `deepseek-box`, compose that one cage without
+duplicating it.
 
 Maps to the ticket's acceptance:
 
@@ -17,25 +18,28 @@ Maps to the ticket's acceptance:
 
 - A **real docker host** (Docker Desktop / OrbStack / Colima / rootless). Run
   these on the host, not inside a box.
-- `claude-box` and `codex-box` from this branch on `PATH`.
+- `claude-box`, `codex-box`, and `deepseek-box` from this branch on `PATH`.
 - A throwaway project dir that is **not** `$HOME` (the launcher refuses `$HOME`
   and its ancestors):
   ```sh
   mkdir -p /tmp/cbtest && cd /tmp/cbtest && git init -q
   ```
 - The **first run of each box builds images**: `cage-base` first, then the
-  payload image `FROM cage-base`. Warm both once and ignore their output:
+  payload image `FROM cage-base`. Warm all three once and ignore their output:
   ```sh
   CLAUDE_BOX_EXEC=1 claude-box -- true >/dev/null 2>&1 || true
   CODEX_BOX_EXEC=1  codex-box  -- true >/dev/null 2>&1 || true
+  DEEPSEEK_BOX_EXEC=1 deepseek-box -- true >/dev/null 2>&1 || true
   ```
 - No harness auth is needed anywhere in this runbook: every in-box command uses
-  the generic exec hook (`CLAUDE_BOX_EXEC` / `CODEX_BOX_EXEC`), which replaces the
-  harness with a bare command run as the host user inside the cage.
+  the generic exec hook (`CLAUDE_BOX_EXEC`, `CODEX_BOX_EXEC`, or
+  `DEEPSEEK_BOX_EXEC`), which replaces the harness with a bare command run as
+  the host user inside the cage.
 
-The exec hook is the seam under test. `CLAUDE_BOX_EXEC=1 claude-box -- <cmd…>`
-(or `CODEX_BOX_EXEC=1 codex-box -- <cmd…>`) runs `<cmd…>` as the in-box command
-instead of the harness, so a check can inspect the cage from the inside.
+The exec hook is the seam under test. For example,
+`DEEPSEEK_BOX_EXEC=1 deepseek-box -- <cmd…>` runs `<cmd…>` as the in-box command
+instead of the harness, so a check can inspect the cage from the inside. The
+Claude and Codex variants use their corresponding `*_BOX_EXEC` variables.
 
 ---
 
@@ -49,14 +53,16 @@ No payload wrapper rebuilds them.
 grep -rln 'engine_args+=(' .            # expect: ./libcage.sh   (one line, nothing else)
 
 # The payload wrappers source the cage; they do not re-implement it:
-grep -n 'source .*libcage.sh' claude-box codex-box   # expect: one match each
+grep -n 'source .*libcage.sh' claude-box codex-box deepseek-box   # expect: one match each
 
 # Parse-check the whole set:
-for f in claude-box codex-box libcage.sh entrypoint-cage.sh userns-probe.sh \
-         payload-init-claude.sh; do bash -n "$f" && echo "parse OK: $f"; done
+for f in claude-box codex-box deepseek-box deepseek-web-proxy.sh libcage.sh \
+         entrypoint-cage.sh userns-probe.sh payload-init-claude.sh; do
+  bash -n "$f" && echo "parse OK: $f"
+done
 ```
 
-PASS: `engine_args+=(` appears only in `libcage.sh`; both wrappers source it;
+PASS: `engine_args+=(` appears only in `libcage.sh`; all wrappers source it;
 every script parses.
 
 ---
@@ -68,14 +74,15 @@ exactly one harness.
 
 ```sh
 # Payloads compose the cage base:
-grep -H '^FROM' Dockerfile.claude Dockerfile.codex
+grep -H '^FROM' Dockerfile.claude Dockerfile.codex Dockerfile.deepseek
 # expect: Dockerfile.claude:FROM cage-base
 #         Dockerfile.codex:FROM cage-base
+#         Dockerfile.deepseek:FROM cage-base
 
 # cage-base has NO agent harness on PATH:
 docker run --rm --entrypoint sh cage-base -c \
-  'command -v claude; command -v codex; echo "exit=$?"'
-# expect: no path printed for either; the final `command -v` returns non-zero
+  'command -v claude; command -v codex; command -v dsh; echo "exit=$?"'
+# expect: no path printed for any harness; the final `command -v` returns non-zero
 
 # cage-base DOES carry the shared tooling (the cage's job):
 docker run --rm --entrypoint sh cage-base -c \
@@ -84,13 +91,13 @@ docker run --rm --entrypoint sh cage-base -c \
 # expect: have git / gh / docker / dockerd-rootless.sh / gosu / uv
 
 # Each payload adds only its own harness on top of the same base:
-docker run --rm --entrypoint sh claude-box -c 'command -v claude && ! command -v codex && echo CLAUDE_ONLY'
-docker run --rm --entrypoint sh codex-box  -c 'command -v codex  && ! command -v claude && echo CODEX_ONLY'
+docker run --rm --entrypoint sh claude-box -c 'command -v claude && ! command -v codex && ! command -v dsh && echo CLAUDE_ONLY'
+docker run --rm --entrypoint sh codex-box  -c 'command -v codex && ! command -v claude && ! command -v dsh && echo CODEX_ONLY'
+docker run --rm --entrypoint sh deepseek-box -c 'command -v dsh && ! command -v claude && ! command -v codex && echo DEEPSEEK_ONLY'
 ```
 
-PASS: `cage-base` resolves neither `claude` nor `codex` but carries the shared
-tooling; `claude-box` has `claude` and not `codex`; `codex-box` has `codex` and
-not `claude`. The boundary is clean in both directions.
+PASS: `cage-base` resolves none of `claude`, `codex`, or `dsh` but carries the
+shared tooling; each payload image resolves only its own harness.
 
 ---
 
@@ -125,9 +132,12 @@ CLAUDE_BOX_EXEC=1 claude-box -- bash -c 'docker run --rm hello-world' | grep -q 
 
 # 4. The same holds for the codex payload (same cage, same engine):
 CODEX_BOX_EXEC=1 codex-box -- bash -c 'docker info --format "{{.SecurityOptions}}"'
+
+# 5. And for the DeepSeek Harness payload:
+DEEPSEEK_BOX_EXEC=1 deepseek-box -- bash -c 'docker info --format "{{.SecurityOptions}}"'
 ```
 
-PASS: `docker info` answers inside both boxes; under the rootless default it
+PASS: `docker info` answers inside all three boxes; under the rootless default it
 contains `name=rootless` and `/var/run/docker.sock` is absent; `hello-world`
 runs to completion. Under `--engine sysbox` or `--engine privileged-dind` the
 daemon is rootful (no `name=rootless`) and `/var/run/docker.sock` is the nested
@@ -139,7 +149,7 @@ the expected result, not a fault.
 
 ---
 
-## Part 3: A mounted host socket is refused (both payloads)
+## Part 3: A mounted host socket is refused (all payloads)
 
 The cage voids its own isolation if a host docker socket is present, so the
 entrypoint refuses to start when one is mounted. This is the cage's guarantee,
@@ -161,9 +171,13 @@ grep -q 'FATAL: /var/run/docker.sock is mounted from the host' err.txt && echo "
 CODEX_BOX_EXTRA_MOUNTS=("${SOCK}:/var/run/docker.sock") \
   CODEX_BOX_EXEC=1 codex-box -- true 2>err.txt; echo "exit=$?"
 grep -q 'FATAL: /var/run/docker.sock is mounted from the host' err.txt && echo "CODEX REFUSED"
+
+DEEPSEEK_BOX_EXTRA_MOUNTS=("${SOCK}:/var/run/docker.sock") \
+  DEEPSEEK_BOX_EXEC=1 deepseek-box -- true 2>err.txt; echo "exit=$?"
+grep -q 'FATAL: /var/run/docker.sock is mounted from the host' err.txt && echo "DEEPSEEK REFUSED"
 ```
 
-PASS: both boxes print the `FATAL: /var/run/docker.sock is mounted from the host`
+PASS: all boxes print the `FATAL: /var/run/docker.sock is mounted from the host`
 refusal and exit non-zero without ever reaching the harness. The refusal lives in
 `entrypoint-cage.sh` (shared), so adding a third payload inherits it for free.
 
@@ -175,26 +189,28 @@ The exit-status contract is the cage's, exercised through each wrapper. The
 harness's status propagates verbatim; a launcher fault maps to its own code. (The
 exhaustive exit-mapping matrix is in
 [runbook-headless-exit.md](runbook-headless-exit.md); here we only confirm the
-seam is wired identically for both payloads.)
+seam is wired identically for every payload.)
 
 ```sh
 cd /tmp/cbtest
 
-for box in "claude-box:CLAUDE_BOX_EXEC" "codex-box:CODEX_BOX_EXEC"; do
+for box in "claude-box:CLAUDE_BOX_EXEC" "codex-box:CODEX_BOX_EXEC" \
+           "deepseek-box:DEEPSEEK_BOX_EXEC"; do
   name="${box%%:*}"; var="${box##*:}"
   env "$var=1" "$name" -- bash -c 'exit 0'   ; echo "$name success -> $?  (expect 0)"
   env "$var=1" "$name" -- bash -c 'exit 7'   ; echo "$name status  -> $?  (expect 7)"
   env "$var=1" "$name" -- bash -c 'kill -INT $$'; echo "$name signal -> $?  (expect 130)"
 done
 
-# The passthrough round-trips stdin (proves -i gating) for both:
+# The passthrough round-trips stdin (proves -i gating) for all three:
 printf 'PING\n' | CLAUDE_BOX_EXEC=1 claude-box -- cat   # expect: PING
 printf 'PING\n' | CODEX_BOX_EXEC=1  codex-box  -- cat   # expect: PING
+printf 'PING\n' | DEEPSEEK_BOX_EXEC=1 deepseek-box -- cat # expect: PING
 ```
 
 PASS: each box returns `0`, `7`, `130` verbatim with no `fault=` line (these are
 harness statuses, not launcher faults), and round-trips the pipe. Identical
-behaviour across both payloads confirms the contract lives in the cage, not the
+behaviour across all payloads confirms the contract lives in the cage, not the
 wrapper.
 
 ---
@@ -203,13 +219,13 @@ wrapper.
 
 | # | Criterion | Expected |
 |---|---|---|
-| 0 | engine block exists once | `engine_args+=(` only in `libcage.sh`; both wrappers source it |
-| 1 | cage base is harness-free | `cage-base` resolves neither `claude` nor `codex` |
+| 0 | engine block exists once | `engine_args+=(` only in `libcage.sh`; all wrappers source it |
+| 1 | cage base is harness-free | `cage-base` resolves none of `claude`, `codex`, or `dsh` |
 | 1 | cage base carries shared tooling | `git`/`gh`/`docker`/`dockerd-rootless.sh`/`gosu`/`uv` present |
 | 1 | payloads compose the cage | each is `FROM cage-base`; adds only its own harness |
-| 2 | nested engine reports itself | `docker info` answers in both boxes |
+| 2 | nested engine reports itself | `docker info` answers in all boxes |
 | 2 | rootless posture | `SecurityOptions` contains `name=rootless`; no `/var/run/docker.sock` |
 | 2 | nested engine runs containers | `hello-world` completes in-box |
-| 3 | host socket refused | both boxes print the FATAL refusal, exit non-zero, never reach the harness |
-| 4 | exit status per payload | `0` / `7` / `130` verbatim, no `fault=` line, both payloads |
-| 4 | stdin round-trip per payload | `PING` echoes back for both |
+| 3 | host socket refused | all boxes print the FATAL refusal, exit non-zero, never reach the harness |
+| 4 | exit status per payload | `0` / `7` / `130` verbatim, no `fault=` line, all payloads |
+| 4 | stdin round-trip per payload | `PING` echoes back for all payloads |

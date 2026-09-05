@@ -13,27 +13,28 @@ jobs:
       - uses: actions/checkout@v5
       - name: Syntax-check shell scripts
         run: |
-          for f in claude-box codex-box libcage.sh entrypoint-cage.sh \
-                   userns-probe.sh payload-init-claude.sh; do
+          for f in claude-box codex-box deepseek-box deepseek-web-proxy.sh \
+                   libcage.sh entrypoint-cage.sh userns-probe.sh payload-init-claude.sh; do
             bash -n "$f"
           done
           echo "parse OK"
       - name: Cage boundary (static)
         run: |
           set -euo pipefail
-          scripts="claude-box codex-box libcage.sh entrypoint-cage.sh userns-probe.sh payload-init-claude.sh"
+          scripts=(claude-box codex-box deepseek-box deepseek-web-proxy.sh
+                   libcage.sh entrypoint-cage.sh userns-probe.sh payload-init-claude.sh)
           # The engine block exists exactly once: among the shell sources, engine_args
           # is built only in the cage library, never in a payload wrapper.
-          hits=$(grep -ln 'engine_args+=(' $scripts || true)
+          hits=$(grep -ln 'engine_args+=(' "${scripts[@]}" || true)
           [ "$hits" = "libcage.sh" ] \
             || { echo "FAIL: engine_args built outside libcage.sh:"; echo "$hits"; exit 1; }
-          # Both wrappers compose the cage rather than reimplementing it.
-          for w in claude-box codex-box; do
+          # Every wrapper composes the cage rather than reimplementing it.
+          for w in claude-box codex-box deepseek-box; do
             grep -q 'source .*libcage.sh' "$w" \
               || { echo "FAIL: $w does not source libcage.sh"; exit 1; }
           done
           # Payload Dockerfiles are FROM the shared cage base.
-          for d in Dockerfile.claude Dockerfile.codex; do
+          for d in Dockerfile.claude Dockerfile.codex Dockerfile.deepseek; do
             grep -q '^FROM cage-base' "$d" \
               || { echo "FAIL: $d is not FROM cage-base"; exit 1; }
           done
@@ -46,7 +47,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # Build cage-base + both payload images through the real launchers, so the
+      # Build cage-base + every payload image through the real launchers, so the
       # image build path itself is under test. --engine none skips the nested
       # dockerd (the one part hosted runners can't reliably provide); every check
       # below is independent of it.
@@ -56,21 +57,78 @@ jobs:
           mkdir -p /tmp/cbtest && cd /tmp/cbtest && git init -q
           CLAUDE_BOX_EXEC=1 "$GITHUB_WORKSPACE/claude-box" --engine none -- true
           CODEX_BOX_EXEC=1  "$GITHUB_WORKSPACE/codex-box"  --engine none -- true
+          DEEPSEEK_BOX_EXEC=1 "$GITHUB_WORKSPACE/deepseek-box" --engine none -- true
 
       # Part 1 — the cage base carries no harness; each payload adds only its own.
       - name: Image boundary
         run: |
           set -euo pipefail
-          if docker run --rm --entrypoint sh cage-base -c 'command -v claude || command -v codex'; then
+          if docker run --rm --entrypoint sh cage-base -c 'command -v claude || command -v codex || command -v dsh'; then
             echo "FAIL: cage-base contains an agent harness"; exit 1
           fi
           docker run --rm --entrypoint sh cage-base -c '
             for b in git gh docker dockerd-rootless.sh gosu uv; do
               command -v "$b" >/dev/null || { echo "MISSING $b"; exit 1; }
             done'
-          docker run --rm --entrypoint sh claude-box -c 'command -v claude >/dev/null && ! command -v codex  >/dev/null'
-          docker run --rm --entrypoint sh codex-box  -c 'command -v codex  >/dev/null && ! command -v claude >/dev/null'
+          docker run --rm --entrypoint sh claude-box -c 'command -v claude >/dev/null && ! command -v codex >/dev/null && ! command -v dsh >/dev/null'
+          docker run --rm --entrypoint sh codex-box -c 'command -v codex >/dev/null && ! command -v claude >/dev/null && ! command -v dsh >/dev/null'
+          docker run --rm --entrypoint sh deepseek-box -c 'command -v dsh >/dev/null && command -v pnpm >/dev/null && command -v deepseek-web-proxy >/dev/null && ! command -v claude >/dev/null && ! command -v codex >/dev/null'
+          docker run --rm --entrypoint dsh deepseek-box --version
           echo "image boundary OK"
+
+      # A real Web UI launch must retain Harness's loopback bind and browser
+      # token fence while remaining reachable through the host-loopback port.
+      - name: DeepSeek Web UI smoke test
+        run: |
+          set -euo pipefail
+          cd /tmp/cbtest
+          verify_dir=$(mktemp -d /tmp/deepseek-box-web.XXXXXX)
+          port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
+          if (( port == 65535 )); then bridge_port=65534; else bridge_port=$((port + 1)); fi
+          name="deepseek-box-web-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          launcher_pid=""
+          cleanup() {
+            docker stop --time 2 "$name" >/dev/null 2>&1 || true
+            if [[ -n "$launcher_pid" ]]; then wait "$launcher_pid" >/dev/null 2>&1 || true; fi
+          }
+          trap cleanup EXIT
+
+          "$GITHUB_WORKSPACE/deepseek-box" --engine none --no-ssh \
+            --port "$port" --name "$name" >"$verify_dir/stdout" 2>"$verify_dir/stderr" &
+          launcher_pid=$!
+
+          startup_url=""
+          for _ in $(seq 1 60); do
+            kill -0 "$launcher_pid" 2>/dev/null \
+              || { echo "launcher exited early"; cat "$verify_dir/stderr"; exit 1; }
+            startup_url=$(sed -n 's/^dsh web: //p' "$verify_dir/stdout" | head -1)
+            [[ -n "$startup_url" ]] && break
+            sleep 1
+          done
+          [[ "$startup_url" == "http://127.0.0.1:${port}/?token="* ]] \
+            || { echo "missing or incorrect startup URL"; cat "$verify_dir/stderr"; exit 1; }
+
+          unauth=$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${port}/")
+          auth=$(curl -sS -L -c "$verify_dir/cookies" -b "$verify_dir/cookies" \
+            -o "$verify_dir/body" -w '%{http_code}' "$startup_url")
+          [[ "$unauth" == 401 && "$auth" == 200 ]] \
+            || { echo "unexpected auth status: $unauth/$auth"; exit 1; }
+          grep -q '<title>DeepSeek Harness</title>' "$verify_dir/body"
+
+          binding=$(docker inspect --format \
+            "{{(index (index .NetworkSettings.Ports \"${bridge_port}/tcp\") 0).HostIp}}:{{(index (index .NetworkSettings.Ports \"${bridge_port}/tcp\") 0).HostPort}}" \
+            "$name")
+          [[ "$binding" == "127.0.0.1:${port}" ]] \
+            || { echo "unexpected published port: $binding"; exit 1; }
+
+          cleanup
+          trap - EXIT
+          if grep -q 'Web UI bridge exited unexpectedly' "$verify_dir/stderr"; then
+            echo "normal shutdown was reported as a bridge failure"
+            cat "$verify_dir/stderr"
+            exit 1
+          fi
+          echo "DeepSeek Web UI OK"
 
       # Part 4 + headless runbook — the exit-status contract holds identically
       # through each wrapper: harness status, signal deaths, and an in-box timeout
@@ -87,7 +145,7 @@ jobs:
               || { echo "FAIL: $box '$*' exited $got, want $want"; exit 1; }
             echo "OK: $box '$*' -> $got"
           }
-          for pair in "claude-box:CLAUDE_BOX_EXEC" "codex-box:CODEX_BOX_EXEC"; do
+          for pair in "claude-box:CLAUDE_BOX_EXEC" "codex-box:CODEX_BOX_EXEC" "deepseek-box:DEEPSEEK_BOX_EXEC"; do
             box="${pair%%:*}"; var="${pair##*:}"
             check "$box" "$var" 0   bash -c 'exit 0'
             check "$box" "$var" 7   bash -c 'exit 7'
@@ -108,7 +166,7 @@ jobs:
         run: |
           set -euo pipefail
           cd /tmp/cbtest
-          for pair in "claude-box:CLAUDE_BOX_EXEC" "codex-box:CODEX_BOX_EXEC"; do
+          for pair in "claude-box:CLAUDE_BOX_EXEC" "codex-box:CODEX_BOX_EXEC" "deepseek-box:DEEPSEEK_BOX_EXEC"; do
             box="${pair%%:*}"; var="${pair##*:}"
             printf '%s_EXTRA_MOUNTS=("/var/run/docker.sock:/var/run/docker.sock")\n' \
               "${var%_EXEC}" > ".env.${box}"

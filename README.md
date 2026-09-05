@@ -1,6 +1,6 @@
 # claude-box
 
-A Docker sandbox for Claude Code / Codex that feels native. Your global skills, plugins, MCP servers, git config, and persistent sessions all carry over — with per-project overrides via a simple `.env.claude-box` file.
+A Docker sandbox for Claude Code, Codex, and DeepSeek Harness that feels native. Your global skills, plugins, MCP servers, git config, and persistent sessions carry over, with per-project overrides via `.env.<box>` files.
 
 ## Why
 
@@ -37,15 +37,15 @@ host state it syncs.
   whatever command the launcher hands it).
 - A payload is a thin wrapper plus a Dockerfile `FROM cage-base`. `claude-box` +
   `Dockerfile.claude` add Claude Code; `codex-box` + `Dockerfile.codex` add the
-  OpenAI Codex CLI. Each wrapper sets a handful of `BOX_*` variables and may
-  define `box_stage` / `box_sync_back` hooks for its own state, then calls
-  `cage_run "$@"`.
+  OpenAI Codex CLI; and `deepseek-box` + `Dockerfile.deepseek` add the official
+  DeepSeek Harness. Each wrapper sets a handful of `BOX_*` variables and may
+  define payload hooks for its own arguments, state, or published ports, then
+  calls `cage_run "$@"`.
 
-A second payload, **codex-box**, ships alongside claude-box and runs the Codex
-CLI in the same cage (`codex-box` on your `PATH`; state persists in
-`~/.codex-box/state/`, auth from a persisted `codex login`). It exists partly to
-keep the boundary honest: anything Claude-specific that leaks into the cage would
-break Codex.
+Two additional payloads ship alongside claude-box: **codex-box** runs the Codex
+CLI with state in `~/.codex-box/state/`, while **deepseek-box** runs DeepSeek
+Harness with state in `~/.deepseek-box/state/`. They keep the boundary honest:
+anything harness-specific that leaks into the cage would break another payload.
 
 To verify the boundary and the nested engine, run
 [docs/cage-engine-acceptance.md](docs/cage-engine-acceptance.md).
@@ -60,11 +60,13 @@ To verify the boundary and the nested engine, run
 
 ```bash
 git clone https://github.com/shftwst/claude-box ~/claude-box
-ln -sf ~/claude-box/claude-box /usr/local/bin/claude-box
-chmod +x ~/claude-box/claude-box
+for box in claude-box codex-box deepseek-box; do
+  ln -sf "$HOME/claude-box/$box" "/usr/local/bin/$box"
+done
+chmod +x ~/claude-box/{claude-box,codex-box,deepseek-box}
 ```
 
-The images build automatically on first run: a shared `cage-base` first, then the `claude-box` payload image on top of it. Either rebuilds when its own inputs change (see [Architecture](#architecture-the-cage)).
+The images build automatically on first run: a shared `cage-base` first, then the selected payload image on top of it. Each rebuilds when its own inputs change (see [Architecture](#architecture-the-cage)).
 
 ## Usage
 
@@ -90,6 +92,46 @@ These are consumed by the wrapper before `claude` sees them (position-free, so t
 - `--engine <mode>` — nested container engine posture: `auto` (default), `sysbox`, `rootless`, `privileged-dind`, `none`. See [Nested container engine](#nested-container-engine).
 - `--name <name>`: name the box's container (default `claude-box-<project>-<pid>`), so a caller can address it with `docker stop` / `docker exec`. Must match docker's charset `[a-zA-Z0-9][a-zA-Z0-9_.-]*`.
 - `--name-file <path>`: write the resolved container name to `<path>` just before launch (removed on exit), so a headless supervisor can discover the box and stop it.
+
+### Codex
+
+`codex-box` passes arguments directly to Codex and uses the same cage flags:
+
+```bash
+codex-box                         # interactive session
+codex-box "fix the flaky test"    # start with a prompt
+codex-box resume --last           # resume the latest session
+```
+
+Codex state persists in `~/.codex-box/state/`. A host `codex login` is seeded
+into the box, and refreshed account authentication is synced back on exit.
+
+### DeepSeek Harness
+
+`deepseek-box` installs the official `@deepseek-ai/dsh` package. Because the
+Harness currently ships a browser UI rather than a terminal UI, a bare launch
+starts `dsh web` and publishes it only on host loopback:
+
+```bash
+deepseek-box                                      # http://127.0.0.1:3080
+deepseek-box --port 3081                          # choose another local port
+deepseek-box --profile headless "fix the tests"   # one headless task
+deepseek-box --version                            # any explicit dsh mode passes through
+```
+
+Harness remains bound to container loopback, as its safety policy requires. A
+cage-local bridge makes it reachable through Docker, which publishes only
+`127.0.0.1:<port>` on the host; it is not exposed on your LAN. Set
+`DEEPSEEK_BOX_PORT` (also supported in `.env.deepseek-box`) to change the
+default. Open the tokenized loopback URL that `dsh` prints at startup; the token
+establishes the browser session before Harness serves the UI.
+
+`DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL`, and
+`DEEPSEEK_SEARCH_BASE_URL` are forwarded when set. You can instead save the API
+key in the Web UI; Harness stores it under `$DSH_HOME`, which persists at
+`~/.deepseek-box/state/` on the host.
+
+DeepSeek Harness is currently a developer preview and may make breaking changes.
 
 ## Ollama
 
@@ -220,9 +262,15 @@ Each entry is passed straight to `docker run -v`, so the standard `:ro` / `:rw` 
 
 ## State
 
-State lives in `~/.claude-box/state/` — this is the `~/.claude` directory as seen by Claude Code inside the container. Conversation history, project memories, and settings persist here across runs.
+Each payload owns a separate persistent state directory:
 
-To reset completely:
+- Claude Code: `~/.claude-box/state/` mounts at `~/.claude`.
+- Codex: `~/.codex-box/state/` mounts at `~/.codex`.
+- DeepSeek Harness: `~/.deepseek-box/state/` mounts at `~/.dsh`.
+
+Conversation history, project memories, settings, and harness-managed
+credentials survive container replacement. To reset one payload completely,
+remove its state directory. For example:
 
 ```bash
 rm -rf ~/.claude-box/state/
@@ -231,10 +279,10 @@ rm -rf ~/.claude-box/state/
 ## Updating
 
 ```bash
-claude-box --upgrade
+claude-box --upgrade       # or codex-box / deepseek-box
 ```
 
-This runs `git pull --ff-only` on the install dir and exits. The images rebuild automatically on the next regular run: `cage-base` when `Dockerfile.cage`, `entrypoint-cage.sh`, or `userns-probe.sh` changed, and the `claude-box` payload image when `Dockerfile.claude`, its `payload-init-claude.sh`, the theme, or `cage-base` itself changed.
+This runs `git pull --ff-only` on the install dir and exits. The images rebuild automatically on the next regular run: `cage-base` when its inputs changed, and each payload image when its Dockerfile, payload inputs, or `cage-base` changed.
 
 On startup, claude-box does a backgrounded `git fetch` against the install dir at most once every 24 hours. When the check finds you're behind upstream, the next launch prints a single hint line:
 

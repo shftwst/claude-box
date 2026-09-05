@@ -1,0 +1,11 @@
+FROM cage-base
+
+# deepseek-box payload: the official DeepSeek Harness plus pnpm, which its
+# profile-plugin manager invokes. cage-base enables Corepack, so remove its
+# pnpm shim before installing the current npm releases as real global packages.
+RUN corepack disable pnpm \
+    && npm install -g @deepseek-ai/dsh@latest pnpm@latest \
+    && npm cache clean --force
+
+COPY deepseek-web-proxy.sh /usr/local/bin/deepseek-web-proxy
+RUN chmod +x /usr/local/bin/deepseek-web-proxy

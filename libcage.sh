@@ -1,29 +1,35 @@
 #!/usr/bin/env bash
 # libcage.sh — the cage, once. Sourced by a thin per-payload wrapper
-# (claude-box, codex-box). The cage owns the outer container, its security
-# posture, the bounded nested engine, the ssh/colima relays, uid mapping, the
-# image build, the exit-status contract, and the docker run assembly. The
-# payload owns which harness command runs and which host state it syncs.
+# (claude-box, codex-box, deepseek-box). The cage owns the outer container, its
+# security posture, the bounded nested engine, the ssh/colima relays, uid
+# mapping, the image build, the exit-status contract, and the docker run
+# assembly. The payload owns which harness command runs and which host state it
+# syncs.
 #
 # A wrapper sets these before calling cage_run "$@":
-#   BOX_LABEL         short name, e.g. claude-box / codex-box (logs, .env file)
+#   BOX_LABEL         short name, e.g. claude-box / deepseek-box (logs, .env file)
 #   BOX_SRC_DIR       dir holding Dockerfile.cage, entrypoint-cage.sh,
 #                     userns-probe.sh, and the payload Dockerfile
 #   BOX_IMAGE         payload image tag, e.g. claude-box
 #   BOX_DOCKERFILE    payload Dockerfile path (FROM cage-base)
 #   BOX_STATE_DIR     host state dir, e.g. ~/.claude-box/state
 #   BOX_STATE_MOUNT   where the state dir mounts in-box, e.g. $HOME/.claude
-#   BOX_ENV_PREFIX    env-knob prefix, e.g. CLAUDE_BOX / CODEX_BOX. Drives
+#   BOX_ENV_PREFIX    env-knob prefix, e.g. CLAUDE_BOX / DEEPSEEK_BOX. Drives
 #                     ${PREFIX}_EXTRA_VARS / _EXTRA_MOUNTS / _ENGINE_MODE /
 #                     _DEBUG / _EXEC so each wrapper keeps its own interface.
 #   BOX_FORWARD_VARS  array of extra env var names to forward (payload creds)
 #   BOX_PAYLOAD_CMD   array: the harness argv the entrypoint execs (the wrapper
 #                     appends the user's passthrough args to it)
+#   BOX_RUN_ARGS      optional array: payload-owned docker-run arguments, such
+#                     as a loopback-only published port for a browser UI
 #
 # A wrapper MAY define these hooks (all optional):
 #   box_parse_arg "$@"   handle a wrapper-specific flag. Set _CONSUMED to the
 #                        number of args eaten and return 0; return non-zero to
 #                        let the cage treat "$1" as a passthrough arg.
+#   box_prepare_payload after cage/project argument parsing and env loading,
+#                        before payload argv assembly. May update
+#                        BOX_PAYLOAD_CMD, HARNESS_ARGS, or BOX_RUN_ARGS.
 #   box_stage            after the generic mounts are built: append to
 #                        override_mounts / env_args, stage relay files, seed
 #                        state. Sees STATE_DIR, PROJECT_DIR, PROJECT_SLUG, etc.
@@ -495,6 +501,7 @@ cage_run() {
     PAYLOAD_CMD=("${HARNESS_ARGS[@]+"${HARNESS_ARGS[@]}"}")
     log "exec hook (${exec_var}): running passthrough args as the in-box command"
   else
+    declare -F box_prepare_payload >/dev/null && box_prepare_payload
     PAYLOAD_CMD=("${BOX_PAYLOAD_CMD[@]}" "${HARNESS_ARGS[@]+"${HARNESS_ARGS[@]}"}")
   fi
 
@@ -544,6 +551,7 @@ cage_run() {
 
   docker run --rm "${TTY_FLAGS[@]}" \
     --name "$CONTAINER_NAME" \
+    ${BOX_RUN_ARGS[@]+"${BOX_RUN_ARGS[@]}"} \
     -e "HOST_UID=$(id -u)" \
     -e "HOST_GID=$(id -g)" \
     -e "HOME=${HOME}" \

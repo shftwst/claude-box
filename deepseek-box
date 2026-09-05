@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# deepseek-box — run the official DeepSeek Harness in the cage (see libcage.sh).
+#
+# With no harness arguments, starts the browser UI on a loopback-only published
+# port (3080 by default). Explicit dsh modes pass through unchanged:
+#   deepseek-box
+#   deepseek-box --port 3081
+#   deepseek-box --profile headless "fix the flaky test"
+#   deepseek-box --version
+#
+# State under ~/.dsh in the container persists at ~/.deepseek-box/state on the
+# host. Set DEEPSEEK_API_KEY in the launching environment, or enter it through
+# the Web UI's model settings. The current project is mounted at its exact path.
+#
+# deepseek-box-specific flags (consumed before dsh sees them; position-free):
+#   --port <1024-65535>         host Web UI port (default: 3080)
+# plus the cage-generic flags (see libcage.sh / README):
+#   --no-ssh / --upgrade / --engine <mode> / --name <name> / --name-file <path>
+#
+# Installation:
+#   ln -sf ~/claude-box/deepseek-box /usr/local/bin/deepseek-box
+
+set -euo pipefail
+
+# Resolve symlinks so an install via `ln -sf` still finds the repo dir.
+_self="${BASH_SOURCE[0]}"
+while [[ -L "$_self" ]]; do
+  _link=$(readlink "$_self")
+  [[ "$_link" = /* ]] && _self="$_link" || _self="$(dirname "$_self")/$_link"
+done
+BOX_SRC_DIR="$(cd "$(dirname "$_self")" && pwd)"
+
+# --- cage config ---
+BOX_LABEL="deepseek-box"
+BOX_IMAGE="deepseek-box"
+BOX_DOCKERFILE="${BOX_SRC_DIR}/Dockerfile.deepseek"
+BOX_STATE_DIR="${HOME}/.deepseek-box/state"
+BOX_STATE_MOUNT="${HOME}/.dsh"
+BOX_ENV_PREFIX="DEEPSEEK_BOX"
+BOX_FORWARD_VARS=(DEEPSEEK_API_KEY DEEPSEEK_BASE_URL DEEPSEEK_SEARCH_BASE_URL)
+BOX_PAYLOAD_CMD=(dsh)
+BOX_RUN_ARGS=()
+BOX_BUILD_INPUTS=("${BOX_SRC_DIR}/deepseek-web-proxy.sh")
+
+_DEEPSEEK_WEB_PORT=""
+
+# shellcheck source=libcage.sh
+source "${BOX_SRC_DIR}/libcage.sh"
+
+# --- wrapper flag: --port <port> ---
+box_parse_arg() {
+  case "$1" in
+    --port)
+      _DEEPSEEK_WEB_PORT="${2:-}"
+      [[ -n "$_DEEPSEEK_WEB_PORT" ]] || { printf '[deepseek-box] --port requires a port\n' >&2; exit 1; }
+      _CONSUMED=2; return 0 ;;
+    --port=*)
+      _DEEPSEEK_WEB_PORT="${1#*=}"
+      [[ -n "$_DEEPSEEK_WEB_PORT" ]] || { printf '[deepseek-box] --port requires a port\n' >&2; exit 1; }
+      _CONSUMED=1; return 0 ;;
+  esac
+  return 1
+}
+
+# A bare invocation is the useful product surface (`dsh web`). Explicit dsh
+# modes remain transparent. The web alias is normalized here so its server binds
+# inside the container while Docker exposes it only on host loopback.
+box_prepare_payload() {
+  local web=0 first="" port bridge_port arg
+
+  if [[ ${#HARNESS_ARGS[@]} -eq 0 ]]; then
+    web=1
+  else
+    first="${HARNESS_ARGS[0]}"
+    case "$first" in
+      web)
+        web=1
+        HARNESS_ARGS=("${HARNESS_ARGS[@]:1}")
+        ;;
+      --profile=web)
+        web=1
+        HARNESS_ARGS=("${HARNESS_ARGS[@]:1}")
+        ;;
+      --profile)
+        if [[ ${#HARNESS_ARGS[@]} -ge 2 && "${HARNESS_ARGS[1]}" == web ]]; then
+          web=1
+          HARNESS_ARGS=("${HARNESS_ARGS[@]:2}")
+        fi
+        ;;
+    esac
+  fi
+
+  if [[ $web -eq 0 ]]; then
+    if [[ -n "$_DEEPSEEK_WEB_PORT" ]]; then
+      printf '[deepseek-box] --port is only valid with the web profile\n' >&2
+      exit 1
+    fi
+    BOX_PAYLOAD_CMD=(dsh)
+    BOX_RUN_ARGS=()
+    return 0
+  fi
+
+  port="${_DEEPSEEK_WEB_PORT:-${DEEPSEEK_BOX_PORT:-3080}}"
+  if [[ ! "$port" =~ ^[1-9][0-9]{3,4}$ ]] || (( port < 1024 || port > 65535 )); then
+    printf '[deepseek-box] invalid port %q (expected 1024-65535)\n' "$port" >&2
+    exit 1
+  fi
+
+  # Host/port binding belongs to the wrapper. In particular, allowing a second
+  # --port after a literal `--` would desynchronize dsh from Docker's mapping.
+  for arg in "${HARNESS_ARGS[@]+"${HARNESS_ARGS[@]}"}"; do
+    case "$arg" in
+      --host|--host=*|--port|--port=*)
+        printf '[deepseek-box] %s is managed by deepseek-box; put --port before the argument separator\n' "$arg" >&2
+        exit 1
+        ;;
+    esac
+  done
+
+  # Harness intentionally binds only loopback. Use a distinct in-container
+  # bridge port so Docker can reach it without weakening that Harness setting.
+  if (( port == 65535 )); then bridge_port=65534; else bridge_port=$((port + 1)); fi
+  BOX_PAYLOAD_CMD=(/usr/local/bin/deepseek-web-proxy "$port" "$bridge_port")
+  BOX_RUN_ARGS=(-p "127.0.0.1:${port}:${bridge_port}")
+  log "Web UI on host port ${port}; open the tokenized URL printed by dsh"
+}
+
+cage_run "$@"
