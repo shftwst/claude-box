@@ -13,7 +13,7 @@ jobs:
       - uses: actions/checkout@v5
       - name: Syntax-check shell scripts
         run: |
-          for f in claude-box codex-box deepseek-box deepseek-web-proxy.sh \
+          for f in claude-box codex-box deepseek-box deepseek-web-proxy.sh pi-box \
                    libcage.sh entrypoint-cage.sh userns-probe.sh payload-init-claude.sh; do
             bash -n "$f"
           done
@@ -21,7 +21,7 @@ jobs:
       - name: Cage boundary (static)
         run: |
           set -euo pipefail
-          scripts=(claude-box codex-box deepseek-box deepseek-web-proxy.sh
+          scripts=(claude-box codex-box deepseek-box deepseek-web-proxy.sh pi-box
                    libcage.sh entrypoint-cage.sh userns-probe.sh payload-init-claude.sh)
           # The engine block exists exactly once: among the shell sources, engine_args
           # is built only in the cage library, never in a payload wrapper.
@@ -29,12 +29,12 @@ jobs:
           [ "$hits" = "libcage.sh" ] \
             || { echo "FAIL: engine_args built outside libcage.sh:"; echo "$hits"; exit 1; }
           # Every wrapper composes the cage rather than reimplementing it.
-          for w in claude-box codex-box deepseek-box; do
+          for w in claude-box codex-box deepseek-box pi-box; do
             grep -q 'source .*libcage.sh' "$w" \
               || { echo "FAIL: $w does not source libcage.sh"; exit 1; }
           done
           # Payload Dockerfiles are FROM the shared cage base.
-          for d in Dockerfile.claude Dockerfile.codex Dockerfile.deepseek; do
+          for d in Dockerfile.claude Dockerfile.codex Dockerfile.deepseek Dockerfile.pi; do
             grep -q '^FROM cage-base' "$d" \
               || { echo "FAIL: $d is not FROM cage-base"; exit 1; }
           done
@@ -58,22 +58,25 @@ jobs:
           CLAUDE_BOX_EXEC=1 "$GITHUB_WORKSPACE/claude-box" --engine none -- true
           CODEX_BOX_EXEC=1  "$GITHUB_WORKSPACE/codex-box"  --engine none -- true
           DEEPSEEK_BOX_EXEC=1 "$GITHUB_WORKSPACE/deepseek-box" --engine none -- true
+          PI_BOX_EXEC=1 "$GITHUB_WORKSPACE/pi-box" --engine none -- true
 
       # Part 1 — the cage base carries no harness; each payload adds only its own.
       - name: Image boundary
         run: |
           set -euo pipefail
-          if docker run --rm --entrypoint sh cage-base -c 'command -v claude || command -v codex || command -v dsh'; then
+          if docker run --rm --entrypoint sh cage-base -c 'command -v claude || command -v codex || command -v dsh || command -v pi'; then
             echo "FAIL: cage-base contains an agent harness"; exit 1
           fi
           docker run --rm --entrypoint sh cage-base -c '
             for b in git gh docker dockerd-rootless.sh gosu uv; do
               command -v "$b" >/dev/null || { echo "MISSING $b"; exit 1; }
             done'
-          docker run --rm --entrypoint sh claude-box -c 'command -v claude >/dev/null && ! command -v codex >/dev/null && ! command -v dsh >/dev/null'
-          docker run --rm --entrypoint sh codex-box -c 'command -v codex >/dev/null && ! command -v claude >/dev/null && ! command -v dsh >/dev/null'
-          docker run --rm --entrypoint sh deepseek-box -c 'command -v dsh >/dev/null && command -v pnpm >/dev/null && command -v deepseek-web-proxy >/dev/null && ! command -v claude >/dev/null && ! command -v codex >/dev/null'
+          docker run --rm --entrypoint sh claude-box -c 'command -v claude >/dev/null && ! command -v codex >/dev/null && ! command -v dsh >/dev/null && ! command -v pi >/dev/null'
+          docker run --rm --entrypoint sh codex-box -c 'command -v codex >/dev/null && ! command -v claude >/dev/null && ! command -v dsh >/dev/null && ! command -v pi >/dev/null'
+          docker run --rm --entrypoint sh deepseek-box -c 'command -v dsh >/dev/null && command -v pnpm >/dev/null && command -v deepseek-web-proxy >/dev/null && ! command -v claude >/dev/null && ! command -v codex >/dev/null && ! command -v pi >/dev/null'
+          docker run --rm --entrypoint sh pi-box -c 'command -v pi >/dev/null && command -v rg >/dev/null && ! command -v claude >/dev/null && ! command -v codex >/dev/null && ! command -v dsh >/dev/null'
           docker run --rm --entrypoint dsh deepseek-box --version
+          docker run --rm --entrypoint pi pi-box --version
           echo "image boundary OK"
 
       # A real Web UI launch must retain Harness's loopback bind and browser
@@ -145,7 +148,8 @@ jobs:
               || { echo "FAIL: $box '$*' exited $got, want $want"; exit 1; }
             echo "OK: $box '$*' -> $got"
           }
-          for pair in "claude-box:CLAUDE_BOX_EXEC" "codex-box:CODEX_BOX_EXEC" "deepseek-box:DEEPSEEK_BOX_EXEC"; do
+          for pair in "claude-box:CLAUDE_BOX_EXEC" "codex-box:CODEX_BOX_EXEC" \
+                      "deepseek-box:DEEPSEEK_BOX_EXEC" "pi-box:PI_BOX_EXEC"; do
             box="${pair%%:*}"; var="${pair##*:}"
             check "$box" "$var" 0   bash -c 'exit 0'
             check "$box" "$var" 7   bash -c 'exit 7'
@@ -166,7 +170,8 @@ jobs:
         run: |
           set -euo pipefail
           cd /tmp/cbtest
-          for pair in "claude-box:CLAUDE_BOX_EXEC" "codex-box:CODEX_BOX_EXEC" "deepseek-box:DEEPSEEK_BOX_EXEC"; do
+          for pair in "claude-box:CLAUDE_BOX_EXEC" "codex-box:CODEX_BOX_EXEC" \
+                      "deepseek-box:DEEPSEEK_BOX_EXEC" "pi-box:PI_BOX_EXEC"; do
             box="${pair%%:*}"; var="${pair##*:}"
             printf '%s_EXTRA_MOUNTS=("/var/run/docker.sock:/var/run/docker.sock")\n' \
               "${var%_EXEC}" > ".env.${box}"

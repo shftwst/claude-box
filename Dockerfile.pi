@@ -1,0 +1,11 @@
+FROM cage-base
+
+# pi-box payload: Pi's official Docker guidance includes ripgrep, while the
+# remaining runtime tools already live in cage-base. Track the current npm
+# release whenever this payload image is built.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ripgrep \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g --ignore-scripts @earendil-works/pi-coding-agent@latest \
+    && npm cache clean --force

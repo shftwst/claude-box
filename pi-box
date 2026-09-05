@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# pi-box — run the official Pi coding agent in the cage (see libcage.sh).
+#
+# Pi's complete state (~/.pi/agent: authentication, settings, extensions,
+# skills, packages, and sessions) persists in ~/.pi-box/state on the host.
+# The current project is mounted at its exact host path.
+#
+# Always runs in the current directory (the project root). cd into your project
+# first, then:
+#   pi-box                         # interactive TUI
+#   pi-box -c                      # continue the most recent session
+#   pi-box -r                      # browse previous sessions
+#   pi-box -p "review this repo"   # one-shot print mode
+#
+# Every argument is passed straight through to pi. Use `--` to force everything
+# after it to pi if a Pi flag overlaps with a cage flag.
+#
+# Cage flags (consumed before pi sees them; see libcage.sh / README):
+#   --no-ssh / --upgrade / --engine <mode> / --name <name> / --name-file <path>
+#
+# Installation:
+#   ln -sf ~/claude-box/pi-box /usr/local/bin/pi-box
+
+set -euo pipefail
+
+# Resolve symlinks so an install via `ln -sf` still finds the repo dir.
+_self="${BASH_SOURCE[0]}"
+while [[ -L "$_self" ]]; do
+  _link=$(readlink "$_self")
+  [[ "$_link" = /* ]] && _self="$_link" || _self="$(dirname "$_self")/$_link"
+done
+BOX_SRC_DIR="$(cd "$(dirname "$_self")" && pwd)"
+
+# --- cage config ---
+BOX_LABEL="pi-box"
+BOX_IMAGE="pi-box"
+BOX_DOCKERFILE="${BOX_SRC_DIR}/Dockerfile.pi"
+BOX_STATE_DIR="${HOME}/.pi-box/state"
+BOX_STATE_MOUNT="${HOME}/.pi/agent"
+BOX_ENV_PREFIX="PI_BOX"
+
+# Pi supports many providers. Forward its documented API-key and cloud-provider
+# variables when present; PI_BOX_EXTRA_VARS remains available for custom ones.
+BOX_FORWARD_VARS=(
+  ANTHROPIC_API_KEY ANT_LING_API_KEY AZURE_OPENAI_API_KEY OPENAI_API_KEY
+  DEEPSEEK_API_KEY NVIDIA_API_KEY GEMINI_API_KEY AWS_BEARER_TOKEN_BEDROCK
+  MISTRAL_API_KEY GROQ_API_KEY CEREBRAS_API_KEY CLOUDFLARE_API_KEY
+  CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_GATEWAY_ID XAI_API_KEY OPENROUTER_API_KEY
+  AI_GATEWAY_API_KEY ZAI_API_KEY ZAI_CODING_CN_API_KEY OPENCODE_API_KEY
+  RADIUS_API_KEY HF_TOKEN FIREWORKS_API_KEY TOGETHER_API_KEY BASETEN_API_KEY
+  KIMI_API_KEY MINIMAX_API_KEY MINIMAX_CN_API_KEY QWEN_TOKEN_PLAN_API_KEY
+  QWEN_TOKEN_PLAN_CN_API_KEY XIAOMI_API_KEY XIAOMI_TOKEN_PLAN_CN_API_KEY
+  XIAOMI_TOKEN_PLAN_AMS_API_KEY XIAOMI_TOKEN_PLAN_SGP_API_KEY
+
+  AZURE_OPENAI_BASE_URL AZURE_OPENAI_RESOURCE_NAME AZURE_OPENAI_API_VERSION
+  AZURE_OPENAI_DEPLOYMENT_NAME_MAP AWS_PROFILE AWS_ACCESS_KEY_ID
+  AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_REGION AWS_DEFAULT_REGION
+  AWS_ENDPOINT_URL_BEDROCK_RUNTIME AWS_BEDROCK_SKIP_AUTH
+  AWS_BEDROCK_FORCE_HTTP1 AWS_BEDROCK_FORCE_CACHE AWS_WEB_IDENTITY_TOKEN_FILE
+  AWS_ROLE_ARN AWS_ROLE_SESSION_NAME GOOGLE_CLOUD_PROJECT GOOGLE_CLOUD_LOCATION
+  GOOGLE_APPLICATION_CREDENTIALS HTTP_PROXY HTTPS_PROXY NO_PROXY
+
+  PI_OFFLINE PI_SKIP_VERSION_CHECK PI_TELEMETRY PI_CACHE_RETENTION
+  PI_SHARE_VIEWER_URL PI_HARDWARE_CURSOR PI_HYPERLINKS PI_IMAGE_PROTOCOL
+  PI_TRUE_COLOR PI_TUI_ESC_TIMEOUT
+)
+BOX_PAYLOAD_CMD=(pi)
+
+# shellcheck source=libcage.sh
+source "${BOX_SRC_DIR}/libcage.sh"
+
+cage_run "$@"

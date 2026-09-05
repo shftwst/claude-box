@@ -1,6 +1,6 @@
 # claude-box
 
-A Docker sandbox for Claude Code, Codex, and DeepSeek Harness that feels native. Your global skills, plugins, MCP servers, git config, and persistent sessions carry over, with per-project overrides via `.env.<box>` files.
+A Docker sandbox for Claude Code, Codex, DeepSeek Harness, and Pi that feels native. The shared cage preserves exact project paths, git/SSH integration, and persistent per-harness state, with per-project overrides via `.env.<box>` files.
 
 ## Why
 
@@ -38,14 +38,14 @@ host state it syncs.
 - A payload is a thin wrapper plus a Dockerfile `FROM cage-base`. `claude-box` +
   `Dockerfile.claude` add Claude Code; `codex-box` + `Dockerfile.codex` add the
   OpenAI Codex CLI; and `deepseek-box` + `Dockerfile.deepseek` add the official
-  DeepSeek Harness. Each wrapper sets a handful of `BOX_*` variables and may
-  define payload hooks for its own arguments, state, or published ports, then
-  calls `cage_run "$@"`.
+  DeepSeek Harness. `pi-box` + `Dockerfile.pi` add the official Pi coding agent.
+  Each wrapper sets a handful of `BOX_*` variables and may define payload hooks
+  for its own arguments, state, or published ports, then calls `cage_run "$@"`.
 
-Two additional payloads ship alongside claude-box: **codex-box** runs the Codex
-CLI with state in `~/.codex-box/state/`, while **deepseek-box** runs DeepSeek
-Harness with state in `~/.deepseek-box/state/`. They keep the boundary honest:
-anything harness-specific that leaks into the cage would break another payload.
+Three additional payloads ship alongside claude-box: **codex-box** runs Codex,
+**deepseek-box** runs DeepSeek Harness, and **pi-box** runs Pi. Each has an
+isolated persistent state directory. They keep the boundary honest: anything
+harness-specific that leaks into the cage would break another payload.
 
 To verify the boundary and the nested engine, run
 [docs/cage-engine-acceptance.md](docs/cage-engine-acceptance.md).
@@ -60,10 +60,10 @@ To verify the boundary and the nested engine, run
 
 ```bash
 git clone https://github.com/shftwst/claude-box ~/claude-box
-for box in claude-box codex-box deepseek-box; do
+for box in claude-box codex-box deepseek-box pi-box; do
   ln -sf "$HOME/claude-box/$box" "/usr/local/bin/$box"
 done
-chmod +x ~/claude-box/{claude-box,codex-box,deepseek-box}
+chmod +x ~/claude-box/{claude-box,codex-box,deepseek-box,pi-box}
 ```
 
 The images build automatically on first run: a shared `cage-base` first, then the selected payload image on top of it. Each rebuilds when its own inputs change (see [Architecture](#architecture-the-cage)).
@@ -132,6 +132,29 @@ key in the Web UI; Harness stores it under `$DSH_HOME`, which persists at
 `~/.deepseek-box/state/` on the host.
 
 DeepSeek Harness is currently a developer preview and may make breaking changes.
+
+### Pi
+
+`pi-box` installs the official [Pi coding agent](https://pi.dev/)
+(`@earendil-works/pi-coding-agent`) and passes arguments directly to its
+terminal UI or non-interactive modes:
+
+```bash
+pi-box                            # interactive TUI
+pi-box -c                         # continue the latest session
+pi-box -r                         # browse previous sessions
+pi-box -p "review this repository" # one-shot print mode
+```
+
+Pi deliberately relies on its runtime environment for isolation, so the shared
+cage supplies the filesystem and nested-engine boundary. Pi state persists in
+`~/.pi-box/state/`, mounted as `~/.pi/agent`; `/login`, settings, extensions,
+skills, packages, and sessions therefore survive container replacement.
+
+The documented provider API keys and cloud-provider variables are forwarded
+when set, including `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `DEEPSEEK_API_KEY`,
+and `GEMINI_API_KEY`. Use `PI_BOX_EXTRA_VARS` for a custom provider variable or
+put project-specific values in `.env.pi-box`.
 
 ## Ollama
 
@@ -267,6 +290,7 @@ Each payload owns a separate persistent state directory:
 - Claude Code: `~/.claude-box/state/` mounts at `~/.claude`.
 - Codex: `~/.codex-box/state/` mounts at `~/.codex`.
 - DeepSeek Harness: `~/.deepseek-box/state/` mounts at `~/.dsh`.
+- Pi: `~/.pi-box/state/` mounts at `~/.pi/agent`.
 
 Conversation history, project memories, settings, and harness-managed
 credentials survive container replacement. To reset one payload completely,
@@ -279,7 +303,7 @@ rm -rf ~/.claude-box/state/
 ## Updating
 
 ```bash
-claude-box --upgrade       # or codex-box / deepseek-box
+claude-box --upgrade       # or codex-box / deepseek-box / pi-box
 ```
 
 This runs `git pull --ff-only` on the install dir and exits. The images rebuild automatically on the next regular run: `cage-base` when its inputs changed, and each payload image when its Dockerfile, payload inputs, or `cage-base` changed.

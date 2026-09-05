@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # libcage.sh — the cage, once. Sourced by a thin per-payload wrapper
-# (claude-box, codex-box, deepseek-box). The cage owns the outer container, its
-# security posture, the bounded nested engine, the ssh/colima relays, uid
-# mapping, the image build, the exit-status contract, and the docker run
-# assembly. The payload owns which harness command runs and which host state it
-# syncs.
+# (claude-box, codex-box, deepseek-box, pi-box). The cage owns the outer
+# container, its security posture, the bounded nested engine, the ssh/colima
+# relays, uid mapping, the image build, the exit-status contract, and the docker
+# run assembly. The payload owns which harness command runs and which host state
+# it syncs.
 #
 # A wrapper sets these before calling cage_run "$@":
 #   BOX_LABEL         short name, e.g. claude-box / deepseek-box (logs, .env file)
